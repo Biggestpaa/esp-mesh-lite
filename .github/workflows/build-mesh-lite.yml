@@ -29,8 +29,6 @@ jobs:
       - name: Clone ESP-IDF (release v5.4, pinned)
         run: |
           git clone --depth 1 --branch release/v5.4 https://github.com/espressif/esp-idf.git $HOME/esp-idf
-          cd $HOME/esp-idf
-          git checkout v5.4.2
 
       - name: Install ESP-IDF tools
         run: |
