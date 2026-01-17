@@ -87,9 +87,17 @@ static esp_err_t esp_storage_init(void)
  * ----------------------------- */
 static void wifi_init(void)
 {
+    /*
+     * CRITICAL FIX:
+     * - LEAF must configure STA (it joins the ROOT SoftAP network and uses GW IP as target).
+     * - ROOT must NOT configure STA in "no_router" mode (no uplink/router exists), otherwise it will spam
+     *   esp_wifi_connect() failures trying to connect to an empty SSID.
+     */
+#if !CONFIG_MESH_ROOT
     wifi_config_t wifi_config;
     memset(&wifi_config, 0x0, sizeof(wifi_config_t));
     esp_bridge_wifi_set_config(WIFI_IF_STA, &wifi_config);
+#endif
 
     wifi_config_t wifi_softap_config = {
         .ap = {
@@ -337,13 +345,16 @@ void app_main(void)
     wifi_init();
 
     esp_mesh_lite_config_t mesh_lite_config = ESP_MESH_LITE_DEFAULT_INIT();
+
+    // Keep joining mesh even if "router status" would be considered down (no_router means no uplink).
     mesh_lite_config.join_mesh_ignore_router_status = true;
 
-#if CONFIG_MESH_ROOT
-    mesh_lite_config.join_mesh_without_configured_wifi = false;
-#else
+    /*
+     * CRITICAL FIX:
+     * In "no_router" mode, BOTH root and leaf must be allowed to form/join mesh
+     * without any configured upstream Wi-Fi credentials.
+     */
     mesh_lite_config.join_mesh_without_configured_wifi = true;
-#endif
 
     esp_mesh_lite_init(&mesh_lite_config);
     app_wifi_set_softap_info();
