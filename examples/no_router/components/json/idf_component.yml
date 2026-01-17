@@ -1,0 +1,4 @@
+version: "1.0.0"
+description: "Shim component to satisfy legacy dependency name 'json' (wraps espressif/cjson)"
+dependencies:
+  espressif/cjson: "^1.7.19"
