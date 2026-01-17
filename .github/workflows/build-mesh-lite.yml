@@ -19,6 +19,14 @@ jobs:
         with:
           submodules: recursive
 
+      # Install ESP-IDF (no docker image tags involved)
+      - name: Setup ESP-IDF
+        uses: espressif/esp-idf-setup-action@v1
+        with:
+          version: v5.4.4
+          # If you want to try IDF 6.0.x instead, change to:
+          # version: v6.0.2
+
       - name: Select sdkconfig.defaults for ${{ matrix.role }}
         run: |
           set -e
@@ -31,16 +39,15 @@ jobs:
           echo "---- sdkconfig.defaults ----"
           cat sdkconfig.defaults
 
-      - name: Build (ESP-IDF)
-        uses: espressif/esp-idf-ci-action@v1
-        with:
-          esp_idf_version: v5.4.5
-          target: esp32s3
-          path: examples/no_router
-          command: |
-            idf.py set-target esp32s3
-            idf.py build
-            idf.py merge-bin
+      - name: Build
+        shell: bash
+        run: |
+          set -e
+          . $IDF_PATH/export.sh
+          cd examples/no_router
+          idf.py set-target esp32s3
+          idf.py build
+          idf.py merge-bin
 
       - name: Collect artifacts
         run: |
