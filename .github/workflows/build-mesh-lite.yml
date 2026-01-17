@@ -21,7 +21,7 @@ jobs:
 
       # Install ESP-IDF (no docker image tags involved)
       - name: Setup ESP-IDF
-        uses: espressif/esp-idf-setup-action@v1
+        uses: espressif/setup-action@v1
         with:
           version: v5.4.4
           # If you want to try IDF 6.0.x instead, change to:
