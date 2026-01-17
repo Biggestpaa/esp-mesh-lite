@@ -1,0 +1,61 @@
+name: Build Mesh-Lite Leaf & Root (ESP32-S3)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [leaf, root]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select sdkconfig.defaults for ${{ matrix.role }}
+        run: |
+          set -e
+          cd examples/no_router
+          if [ "${{ matrix.role }}" = "root" ]; then
+            cp sdkconfig.defaults.root sdkconfig.defaults
+          else
+            cp sdkconfig.defaults.leaf sdkconfig.defaults
+          fi
+          echo "---- sdkconfig.defaults ----"
+          cat sdkconfig.defaults
+
+      - name: Build (ESP-IDF)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: latest
+          target: esp32s3
+          path: examples/no_router
+          command: |
+            idf.py set-target esp32s3
+            idf.py build
+            idf.py merge-bin
+
+      - name: Collect artifacts
+        run: |
+          set -e
+          OUT="artifacts_${{ matrix.role }}"
+          mkdir -p "$OUT"
+          cp -v examples/no_router/build/*.bin "$OUT/" || true
+          cp -v examples/no_router/build/*.elf "$OUT/" || true
+          cp -v examples/no_router/build/*.map "$OUT/" || true
+          cp -v examples/no_router/build/flasher_args.json "$OUT/" || true
+          cp -v examples/no_router/build/merged*.bin "$OUT/" || true
+          ls -lah "$OUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh-lite-${{ matrix.role }}-esp32s3
+          path: artifacts_${{ matrix.role }}
