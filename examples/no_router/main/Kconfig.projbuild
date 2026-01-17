@@ -14,4 +14,24 @@ menu "Example Configuration"
         help
             Mesh network channel.
 
+    config UART_BAUD
+        int "UART baud rate"
+        default 115200
+
+    config UART_RX_GPIO
+        int "UART RX GPIO"
+        default 16
+
+    config UART_TX_GPIO
+        int "UART TX GPIO"
+        default 17
+
+    config UDP_PORT
+        int "UDP port for leaf->root forwarding"
+        default 4510
+
+    config MAX_LINE_LEN
+        int "Max ASCII line length (bytes, excluding '\\n')"
+        default 100
+
 endmenu
