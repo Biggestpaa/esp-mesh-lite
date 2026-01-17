@@ -14,36 +14,46 @@ jobs:
         role: [leaf, root]
 
     steps:
-      - name: Checkout
+      - name: Checkout project
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # Install ESP-IDF (no docker image tags involved)
-      - name: Setup ESP-IDF
-        uses: espressif/setup-esp-idf@v1
-        with:
-          version: v5.4.4
-          # If you want to try IDF 6.0.x instead, change to:
-          # version: v6.0.2
-
-      - name: Select sdkconfig.defaults for ${{ matrix.role }}
+      - name: Install system dependencies
         run: |
-          set -e
+          sudo apt-get update
+          sudo apt-get install -y \
+            git wget flex bison gperf python3 python3-pip python3-venv \
+            cmake ninja-build ccache libffi-dev libssl-dev dfu-util
+
+      - name: Clone ESP-IDF (v5.4.4)
+        run: |
+          git clone --depth 1 --branch v5.4.4 https://github.com/espressif/esp-idf.git $HOME/esp-idf
+
+      - name: Install ESP-IDF tools
+        run: |
+          cd $HOME/esp-idf
+          ./install.sh esp32s3
+
+      - name: Export ESP-IDF environment
+        run: |
+          echo "$HOME/esp-idf/tools" >> $GITHUB_PATH
+          echo "IDF_PATH=$HOME/esp-idf" >> $GITHUB_ENV
+
+      - name: Select sdkconfig.defaults for role
+        run: |
           cd examples/no_router
           if [ "${{ matrix.role }}" = "root" ]; then
             cp sdkconfig.defaults.root sdkconfig.defaults
           else
             cp sdkconfig.defaults.leaf sdkconfig.defaults
           fi
-          echo "---- sdkconfig.defaults ----"
           cat sdkconfig.defaults
 
-      - name: Build
+      - name: Build firmware
         shell: bash
         run: |
-          set -e
-          . $IDF_PATH/export.sh
+          source $HOME/esp-idf/export.sh
           cd examples/no_router
           idf.py set-target esp32s3
           idf.py build
@@ -51,14 +61,13 @@ jobs:
 
       - name: Collect artifacts
         run: |
-          set -e
           OUT="artifacts_${{ matrix.role }}"
           mkdir -p "$OUT"
-          cp -v examples/no_router/build/*.bin "$OUT/" || true
-          cp -v examples/no_router/build/*.elf "$OUT/" || true
-          cp -v examples/no_router/build/*.map "$OUT/" || true
-          cp -v examples/no_router/build/flasher_args.json "$OUT/" || true
-          cp -v examples/no_router/build/merged*.bin "$OUT/" || true
+          cp examples/no_router/build/*.bin "$OUT/" || true
+          cp examples/no_router/build/*.elf "$OUT/" || true
+          cp examples/no_router/build/*.map "$OUT/" || true
+          cp examples/no_router/build/flasher_args.json "$OUT/" || true
+          cp examples/no_router/build/merged*.bin "$OUT/" || true
           ls -lah "$OUT"
 
       - name: Upload artifacts
