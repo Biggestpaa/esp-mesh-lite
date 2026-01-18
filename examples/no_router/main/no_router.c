@@ -88,8 +88,10 @@ static esp_err_t esp_storage_init(void)
 static void wifi_init(void)
 {
     /*
-     * LEAF must configure STA (it joins the ROOT SoftAP network and uses GW IP as target).
-     * ROOT must NOT configure STA credentials in "no_router" mode.
+     * CRITICAL FIX:
+     * - LEAF must configure STA (it joins the ROOT SoftAP network and uses GW IP as target).
+     * - ROOT must NOT configure STA in "no_router" mode (no uplink/router exists), otherwise it will spam
+     *   esp_wifi_connect() failures trying to connect to an empty SSID.
      */
 #if !CONFIG_MESH_ROOT
     wifi_config_t wifi_config;
@@ -168,7 +170,7 @@ static void uart_init_bridge(void)
 
 static inline bool is_allowed_ascii(uint8_t c)
 {
-    // Allow: printable ASCII; tolerate CR/LF
+    // Allow: printable ASCII + comma + minus; we also tolerate CR
     if (c == '\r') return true;
     if (c == '\n') return true;
     return (c >= 0x20 && c <= 0x7E);
@@ -200,6 +202,7 @@ static struct sockaddr_in root_addr;
 
 static void leaf_udp_init_when_ready(void)
 {
+    // Wait until we have a gateway; in Mesh-Lite this is effectively the upstream/root bridge IP.
     struct in_addr gw;
     while (!get_gateway_ip(&gw)) {
         vTaskDelay(pdMS_TO_TICKS(250));
@@ -346,10 +349,14 @@ void app_main(void)
     // Keep joining mesh even if "router status" would be considered down (no_router means no uplink).
     mesh_lite_config.join_mesh_ignore_router_status = true;
 
-    // Allow forming/joining mesh without any configured upstream Wi-Fi credentials.
+    /*
+     * In "no_router" mode, BOTH root and leaf must be allowed to form/join mesh
+     * without any configured upstream Wi-Fi credentials.
+     */
     mesh_lite_config.join_mesh_without_configured_wifi = true;
 
-    ESP_ERROR_CHECK(esp_mesh_lite_init(&mesh_lite_config));
+    // These are VOID-returning APIs in your version, so do not wrap with ESP_ERROR_CHECK
+    esp_mesh_lite_init(&mesh_lite_config);
 
     // *** KEY FIX ***
     // Force mesh-only networking mode so ROOT won't attempt to connect to an external AP/router.
@@ -365,7 +372,8 @@ void app_main(void)
     esp_mesh_lite_set_disallowed_level(1);
 #endif
 
-    ESP_ERROR_CHECK(esp_mesh_lite_start());
+    // VOID-returning API
+    esp_mesh_lite_start();
 
     // UART bridge init for both roles
     uart_init_bridge();
