@@ -35,7 +35,9 @@
 #include "driver/uart.h"
 
 #include "esp_bridge.h"
-#include "esp_mesh_lite.h"   // includes core APIs too
+#include "esp_mesh_lite.h"  
+#include "esp_mesh_lite_core.h"
+#include "esp_mesh_lite_port.h"
 
 static const char *TAG = "no_router_uart_udp";
 
