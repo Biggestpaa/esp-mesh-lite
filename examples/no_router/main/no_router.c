@@ -10,8 +10,10 @@
  * NO ROUTER / NO INTERNET
  *
  * Key behavior:
- * - We do NOT force AP-only on ROOT (that breaks Mesh-Lite and caused your crash).
- * - We DO force Mesh-Lite into MESH networking mode so it stops trying to connect to an upstream AP/router.
+ * - We do NOT force AP-only on ROOT (that broke Mesh-Lite and caused your crash).
+ * - We DO force Mesh-Lite into MESH networking mode and clear router config so it stops trying
+ *   to connect to an upstream AP/router.
+ * - We print the resulting networking mode + error codes so there's no guessing.
  */
 
 #include <inttypes.h>
@@ -20,6 +22,8 @@
 
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_err.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -35,7 +39,7 @@
 #include "driver/uart.h"
 
 #include "esp_bridge.h"
-#include "esp_mesh_lite.h"  
+#include "esp_mesh_lite.h"
 #include "esp_mesh_lite_core.h"
 #include "esp_mesh_lite_port.h"
 
@@ -49,6 +53,8 @@ static TaskHandle_t sysinfo_task_h = NULL;
 
 static void sysinfo_task(void *arg)
 {
+    (void)arg;
+
     uint8_t primary = 0;
     uint8_t sta_mac[6] = {0};
     wifi_ap_record_t ap_info = {0};
@@ -230,6 +236,37 @@ static void root_udp_to_uart_task(void *arg)
 #endif
 
 /* ============================================================
+ * Mesh-Lite policy for "no_router"
+ * ============================================================ */
+
+static void mesh_no_router_policy_apply(void)
+{
+    esp_err_t err;
+
+    // 1) Force MESH-only networking mode
+    err = esp_mesh_lite_set_networking_mode(ESP_MESH_LITE_MESH, 0);
+    ESP_LOGI(TAG, "set_networking_mode(MESH) -> %s", esp_err_to_name(err));
+
+    // 2) Clear router/uplink config (prevents any upstream connect target)
+    // NOTE: type name comes from esp_mesh_lite_port.h in this release
+    mesh_lite_sta_config_t rcfg;
+    memset(&rcfg, 0, sizeof(rcfg));
+    err = esp_mesh_lite_set_router_config(&rcfg);
+    ESP_LOGI(TAG, "set_router_config(empty) -> %s", esp_err_to_name(err));
+
+    // 3) Print the mode so you can verify on the monitor (no guessing)
+    esp_mesh_lite_networking_mode_t mode = ESP_MESH_LITE_ROUTER;
+    err = esp_mesh_lite_get_networking_mode(&mode);
+    ESP_LOGI(TAG, "get_networking_mode -> %s, mode=%s",
+             esp_err_to_name(err),
+             (mode == ESP_MESH_LITE_MESH) ? "MESH" : "ROUTER");
+
+    // 4) Backoff reconnect attempts (reduces connect-spam/crashes if something still triggers)
+    // (min_s, max_s, max_failed_count_or_timeout depending on implementation; safe to call)
+    esp_mesh_lite_set_wifi_reconnect_interval(30, 0, 3600);
+}
+
+/* ============================================================
  * APP MAIN
  * ============================================================ */
 
@@ -251,8 +288,8 @@ void app_main(void)
     // void-return API in this release
     esp_mesh_lite_init(&cfg);
 
-    // ✅ REAL FIX: force mesh-only networking mode (stops upstream/router STA connect attempts)
-    ESP_ERROR_CHECK(esp_mesh_lite_set_networking_mode(ESP_MESH_LITE_MESH, 0));
+    // Apply "no_router" policy BEFORE start
+    mesh_no_router_policy_apply();
 
     app_wifi_set_softap_info();
 
@@ -266,8 +303,6 @@ void app_main(void)
 
     // void-return API
     esp_mesh_lite_start();
-
-    // ❌ Removed the AP-only clamp. It breaks Mesh-Lite and caused your crash.
 
     uart_init_bridge();
 
