@@ -7,7 +7,11 @@
  * ROOT:
  *   UDP -> UART
  *
- * NO ROUTER / NO INTERNET / NO STA CONNECTS ON ROOT
+ * NO ROUTER / NO INTERNET
+ *
+ * Key behavior:
+ * - We do NOT force AP-only on ROOT (that breaks Mesh-Lite and caused your crash).
+ * - We DO force Mesh-Lite into MESH networking mode so it stops trying to connect to an upstream AP/router.
  */
 
 #include <inttypes.h>
@@ -31,7 +35,7 @@
 #include "driver/uart.h"
 
 #include "esp_bridge.h"
-#include "esp_mesh_lite.h"
+#include "esp_mesh_lite.h"   // includes core APIs too
 
 static const char *TAG = "no_router_uart_udp";
 
@@ -53,12 +57,14 @@ static void sysinfo_task(void *arg)
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         if (esp_mesh_lite_get_level() > 1) {
-            esp_wifi_sta_get_ap_info(&ap_info);
+            (void)esp_wifi_sta_get_ap_info(&ap_info);
+        } else {
+            memset(&ap_info, 0, sizeof(ap_info));
         }
 
-        esp_wifi_get_mac(ESP_IF_WIFI_STA, sta_mac);
-        esp_wifi_ap_get_sta_list(&wifi_sta_list);
-        esp_wifi_get_channel(&primary, &second);
+        (void)esp_wifi_get_mac(ESP_IF_WIFI_STA, sta_mac);
+        (void)esp_wifi_ap_get_sta_list(&wifi_sta_list);
+        (void)esp_wifi_get_channel(&primary, &second);
 
         ESP_LOGI(TAG,
                  "System info, ch=%d layer=%d self=" MACSTR
@@ -79,6 +85,7 @@ static void sysinfo_task(void *arg)
 
 static void sysinfo_timer_cb(TimerHandle_t t)
 {
+    (void)t;
     if (sysinfo_task_h) {
         xTaskNotifyGive(sysinfo_task_h);
     }
@@ -146,7 +153,8 @@ static void app_wifi_set_softap_info(void)
     }
 
     ESP_LOGI(TAG, "SoftAP SSID: %s", ssid);
-    esp_mesh_lite_set_softap_info(ssid, psk);
+    ESP_LOGI(TAG, "SoftAP PSK: [HIDDEN]");
+    ESP_ERROR_CHECK(esp_mesh_lite_set_softap_info(ssid, psk));
 }
 
 /* ============================================================
@@ -183,14 +191,28 @@ static void uart_init_bridge(void)
 
 static void root_udp_to_uart_task(void *arg)
 {
+    (void)arg;
+
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "Root socket() failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_port = htons(CONFIG_UDP_PORT),
         .sin_addr.s_addr = htonl(INADDR_ANY),
     };
 
-    bind(sock, (struct sockaddr *)&addr, sizeof(addr));
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        ESP_LOGE(TAG, "Root bind() failed on port %d", CONFIG_UDP_PORT);
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
     ESP_LOGI(TAG, "Root UDP listening on %d", CONFIG_UDP_PORT);
 
     uint8_t buf[256];
@@ -224,7 +246,12 @@ void app_main(void)
     cfg.join_mesh_ignore_router_status = true;
     cfg.join_mesh_without_configured_wifi = true;
 
+    // void-return API in this release
     esp_mesh_lite_init(&cfg);
+
+    // ✅ REAL FIX: force mesh-only networking mode (stops upstream/router STA connect attempts)
+    ESP_ERROR_CHECK(esp_mesh_lite_set_networking_mode(ESP_MESH_LITE_MESH, 0));
+
     app_wifi_set_softap_info();
 
 #if CONFIG_MESH_ROOT
@@ -235,16 +262,10 @@ void app_main(void)
     esp_mesh_lite_set_disallowed_level(1);
 #endif
 
+    // void-return API
     esp_mesh_lite_start();
 
-#if CONFIG_MESH_ROOT
-    /* ================================
-     * GUARANTEED FIX:
-     * ROOT MUST NEVER CONNECT STA
-     * ================================ */
-    ESP_ERROR_CHECK(esp_wifi_disconnect());
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-#endif
+    // ❌ Removed the AP-only clamp. It breaks Mesh-Lite and caused your crash.
 
     uart_init_bridge();
 
