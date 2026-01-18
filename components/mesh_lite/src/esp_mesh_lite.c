@@ -15,9 +15,31 @@
 #include "esp_mac.h"
 #include "esp_bridge.h"
 #include "esp_mesh_lite.h"
+#include "esp_mesh_lite_core.h"
+#include "esp_mesh_lite_port.h"
 #include "mesh_lite.pb-c.h"
 
 static const char *TAG = "Mesh-Lite";
+
+/* ============================================================
+ * NO_ROUTER FIX:
+ * If we're ROOT and networking_mode == MESH, never trigger
+ * upstream STA connect/reconnect attempts.
+ * ============================================================ */
+static bool mesh_lite_is_no_router_root_mesh_mode(void)
+{
+    if (esp_mesh_lite_get_level() != ROOT) {
+        return false;
+    }
+
+    esp_mesh_lite_networking_mode_t mode = ESP_MESH_LITE_ROUTER;
+    if (esp_mesh_lite_get_networking_mode(&mode) == ESP_OK) {
+        return (mode == ESP_MESH_LITE_MESH);
+    }
+
+    // If we cannot read mode, do not change behaviour.
+    return false;
+}
 
 #if CONFIG_MESH_LITE_NODE_INFO_REPORT
 
@@ -368,6 +390,12 @@ uint32_t esp_mesh_lite_get_mesh_node_number(void)
 static void esp_mesh_lite_event_sta_lost_ip_handler(void *arg, esp_event_base_t event_base,
                                                     int32_t event_id, void *event_data)
 {
+    // ROOT + MESH(no_router): never do upstream reconnect attempts.
+    if (mesh_lite_is_no_router_root_mesh_mode()) {
+        ESP_LOGI(TAG, "STA lost IP ignored (ROOT + MESH no_router)");
+        return;
+    }
+
     wifi_ap_record_t ap_info;
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
         ESP_LOGW(TAG, "STA lost IP, reconnecting");
@@ -380,6 +408,11 @@ static void esp_mesh_lite_event_ip_changed_handler(void *arg, esp_event_base_t e
 {
     switch (event_id) {
     case ESP_MESH_LITE_EVENT_CORE_STARTED:
+        // ROOT + MESH(no_router): do not trigger upstream connect on start
+        if (mesh_lite_is_no_router_root_mesh_mode()) {
+            ESP_LOGI(TAG, "Mesh-Lite started (ROOT + MESH no_router): skip connect");
+            break;
+        }
         ESP_LOGI(TAG, "Mesh-Lite connecting");
         esp_mesh_lite_connect();
         break;
