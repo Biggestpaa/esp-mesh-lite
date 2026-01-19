@@ -10,10 +10,9 @@
  * NO ROUTER / NO INTERNET
  *
  * Key behavior:
- * - We do NOT force AP-only on ROOT (that broke Mesh-Lite and caused your crash).
- * - We DO force Mesh-Lite into MESH networking mode and clear router config so it stops trying
- *   to connect to an upstream AP/router.
- * - We print the resulting networking mode + error codes so there's no guessing.
+ * - Force Mesh-Lite networking mode to MESH and clear router config (no uplink)
+ * - ROOT does NOT attempt upstream connect when used with the Mesh-Lite core fix
+ * - LEAF forwards scanner UART lines as UDP datagrams to ROOT (target = STA gateway)
  */
 
 #include <inttypes.h>
@@ -33,6 +32,8 @@
 #include "esp_mac.h"
 
 #include "esp_netif.h"
+#include "esp_event.h"
+
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 
@@ -121,6 +122,7 @@ static esp_err_t esp_storage_init(void)
 static void wifi_init(void)
 {
 #if !CONFIG_MESH_ROOT
+    // Leaf: empty STA config is OK; mesh decides parent
     wifi_config_t sta_cfg = {0};
     esp_bridge_wifi_set_config(WIFI_IF_STA, &sta_cfg);
 #endif
@@ -171,6 +173,8 @@ static void app_wifi_set_softap_info(void)
 
 static void uart_init_bridge(void)
 {
+    const uart_port_t U = UART_NUM_1;
+
     uart_config_t cfg = {
         .baud_rate = CONFIG_UART_BAUD,
         .data_bits = UART_DATA_8_BITS,
@@ -180,19 +184,164 @@ static void uart_init_bridge(void)
         .source_clk = UART_SCLK_DEFAULT,
     };
 
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, 4096, 0, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &cfg));
-    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1,
+    // RX buffer enabled so leaf can read scanner stream
+    ESP_ERROR_CHECK(uart_driver_install(U, 4096, 4096, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(U, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(U,
                                 CONFIG_UART_TX_GPIO,
                                 CONFIG_UART_RX_GPIO,
                                 UART_PIN_NO_CHANGE,
                                 UART_PIN_NO_CHANGE));
 
-    ESP_LOGI(TAG, "UART ready @ %d baud", CONFIG_UART_BAUD);
+    ESP_LOGI(TAG, "UART ready @ %d baud (UART1 TX=%d RX=%d)",
+             CONFIG_UART_BAUD, CONFIG_UART_TX_GPIO, CONFIG_UART_RX_GPIO);
 }
 
 /* ============================================================
- * UDP ROOT
+ * Mesh-Lite policy for "no_router"
+ * ============================================================ */
+
+static void mesh_no_router_policy_apply(void)
+{
+    esp_err_t err;
+
+    // 1) Force MESH-only networking mode (no uplink)
+    err = esp_mesh_lite_set_networking_mode(ESP_MESH_LITE_MESH, 0);
+    ESP_LOGI(TAG, "set_networking_mode(MESH) -> %s", esp_err_to_name(err));
+
+    // 2) Clear router/uplink config (prevents any upstream connect target)
+    mesh_lite_sta_config_t rcfg;
+    memset(&rcfg, 0, sizeof(rcfg));
+    err = esp_mesh_lite_set_router_config(&rcfg);
+    ESP_LOGI(TAG, "set_router_config(empty) -> %s", esp_err_to_name(err));
+
+    // 3) Print mode for verification
+    esp_mesh_lite_networking_mode_t mode = ESP_MESH_LITE_ROUTER;
+    err = esp_mesh_lite_get_networking_mode(&mode);
+    ESP_LOGI(TAG, "get_networking_mode -> %s, mode=%s",
+             esp_err_to_name(err),
+             (mode == ESP_MESH_LITE_MESH) ? "MESH" : "ROUTER");
+
+    // 4) Backoff reconnect spam (safe even if ignored internally)
+    esp_mesh_lite_set_wifi_reconnect_interval(30, 0, 3600);
+}
+
+/* ============================================================
+ * LEAF: UART -> UDP (to ROOT)
+ * ============================================================ */
+
+#if !CONFIG_MESH_ROOT
+
+#ifndef CONFIG_MAX_LINE_LEN
+#define CONFIG_MAX_LINE_LEN 128
+#endif
+
+static int leaf_udp_sock = -1;
+static struct sockaddr_in root_addr;
+
+static inline bool is_allowed_ascii(uint8_t c)
+{
+    // scanner sends ASCII like: room,tag,rssi\n
+    // allow printable ASCII
+    return (c >= 32 && c <= 126);
+}
+
+static void leaf_udp_init_when_ready(void)
+{
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta) {
+        ESP_LOGE(TAG, "Leaf: WIFI_STA_DEF netif not found");
+        return;
+    }
+
+    esp_netif_ip_info_t ip;
+    if (esp_netif_get_ip_info(sta, &ip) != ESP_OK) {
+        ESP_LOGW(TAG, "Leaf: esp_netif_get_ip_info failed");
+        return;
+    }
+
+    if (ip.gw.addr == 0) {
+        ESP_LOGW(TAG, "Leaf: no GW yet; waiting for IP");
+        return;
+    }
+
+    int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (s < 0) {
+        ESP_LOGE(TAG, "Leaf: socket() failed");
+        return;
+    }
+
+    memset(&root_addr, 0, sizeof(root_addr));
+    root_addr.sin_family = AF_INET;
+    root_addr.sin_port = htons(CONFIG_UDP_PORT);
+    root_addr.sin_addr.s_addr = ip.gw.addr; // ROOT is our gateway
+
+    leaf_udp_sock = s;
+
+    ESP_LOGI(TAG, "Leaf UDP target: %s:%d",
+             inet_ntoa(root_addr.sin_addr), CONFIG_UDP_PORT);
+}
+
+static void leaf_uart_to_udp_task(void *arg)
+{
+    (void)arg;
+    const uart_port_t U = UART_NUM_1;
+
+    while (leaf_udp_sock < 0) {
+        leaf_udp_init_when_ready();
+        if (leaf_udp_sock >= 0) break;
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    static uint8_t line[CONFIG_MAX_LINE_LEN + 2];
+    size_t len = 0;
+
+    uint8_t rx[256];
+
+    for (;;) {
+        int n = uart_read_bytes(U, rx, sizeof(rx), pdMS_TO_TICKS(100));
+        if (n <= 0) continue;
+
+        for (int i = 0; i < n; i++) {
+            uint8_t c = rx[i];
+
+            if (c == '\r') continue;
+
+            if (c == '\n') {
+                if (len == 0) continue;
+
+                line[len++] = '\n';
+
+                int sent = sendto(leaf_udp_sock, line, len, 0,
+                                  (struct sockaddr *)&root_addr, sizeof(root_addr));
+                if (sent < 0) {
+                    ESP_LOGW(TAG, "Leaf: sendto failed");
+                }
+
+                len = 0;
+                continue;
+            }
+
+            if (!is_allowed_ascii(c)) {
+                // noise/binary: drop partial line
+                len = 0;
+                continue;
+            }
+
+            if (len < (size_t)CONFIG_MAX_LINE_LEN) {
+                line[len++] = c;
+            } else {
+                // oversized: drop line
+                len = 0;
+            }
+        }
+    }
+}
+
+#endif /* !CONFIG_MESH_ROOT */
+
+/* ============================================================
+ * ROOT: UDP -> UART
  * ============================================================ */
 
 #if CONFIG_MESH_ROOT
@@ -200,10 +349,11 @@ static void uart_init_bridge(void)
 static void root_udp_to_uart_task(void *arg)
 {
     (void)arg;
+    const uart_port_t U = UART_NUM_1;
 
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (sock < 0) {
-        ESP_LOGE(TAG, "Root socket() failed");
+        ESP_LOGE(TAG, "Root: socket() failed");
         vTaskDelete(NULL);
         return;
     }
@@ -215,7 +365,7 @@ static void root_udp_to_uart_task(void *arg)
     };
 
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        ESP_LOGE(TAG, "Root bind() failed on port %d", CONFIG_UDP_PORT);
+        ESP_LOGE(TAG, "Root: bind() failed on port %d", CONFIG_UDP_PORT);
         close(sock);
         vTaskDelete(NULL);
         return;
@@ -223,48 +373,17 @@ static void root_udp_to_uart_task(void *arg)
 
     ESP_LOGI(TAG, "Root UDP listening on %d", CONFIG_UDP_PORT);
 
-    uint8_t buf[256];
+    uint8_t buf[CONFIG_MAX_LINE_LEN + 2];
 
     for (;;) {
         int n = recvfrom(sock, buf, sizeof(buf), 0, NULL, NULL);
         if (n > 0) {
-            uart_write_bytes(UART_NUM_1, (char *)buf, n);
+            uart_write_bytes(U, (const char *)buf, n);
         }
     }
 }
 
-#endif
-
-/* ============================================================
- * Mesh-Lite policy for "no_router"
- * ============================================================ */
-
-static void mesh_no_router_policy_apply(void)
-{
-    esp_err_t err;
-
-    // 1) Force MESH-only networking mode
-    err = esp_mesh_lite_set_networking_mode(ESP_MESH_LITE_MESH, 0);
-    ESP_LOGI(TAG, "set_networking_mode(MESH) -> %s", esp_err_to_name(err));
-
-    // 2) Clear router/uplink config (prevents any upstream connect target)
-    // NOTE: type name comes from esp_mesh_lite_port.h in this release
-    mesh_lite_sta_config_t rcfg;
-    memset(&rcfg, 0, sizeof(rcfg));
-    err = esp_mesh_lite_set_router_config(&rcfg);
-    ESP_LOGI(TAG, "set_router_config(empty) -> %s", esp_err_to_name(err));
-
-    // 3) Print the mode so you can verify on the monitor (no guessing)
-    esp_mesh_lite_networking_mode_t mode = ESP_MESH_LITE_ROUTER;
-    err = esp_mesh_lite_get_networking_mode(&mode);
-    ESP_LOGI(TAG, "get_networking_mode -> %s, mode=%s",
-             esp_err_to_name(err),
-             (mode == ESP_MESH_LITE_MESH) ? "MESH" : "ROUTER");
-
-    // 4) Backoff reconnect attempts (reduces connect-spam/crashes if something still triggers)
-    // (min_s, max_s, max_failed_count_or_timeout depending on implementation; safe to call)
-    esp_mesh_lite_set_wifi_reconnect_interval(30, 0, 3600);
-}
+#endif /* CONFIG_MESH_ROOT */
 
 /* ============================================================
  * APP MAIN
@@ -285,10 +404,9 @@ void app_main(void)
     cfg.join_mesh_ignore_router_status = true;
     cfg.join_mesh_without_configured_wifi = true;
 
-    // void-return API in this release
     esp_mesh_lite_init(&cfg);
 
-    // Apply "no_router" policy BEFORE start
+    // Apply no_router policy BEFORE start
     mesh_no_router_policy_apply();
 
     app_wifi_set_softap_info();
@@ -301,20 +419,17 @@ void app_main(void)
     esp_mesh_lite_set_disallowed_level(1);
 #endif
 
-    // void-return API
     esp_mesh_lite_start();
 
     uart_init_bridge();
 
 #if CONFIG_MESH_ROOT
-    xTaskCreate(root_udp_to_uart_task,
-                "root_udp_to_uart",
-                4096, NULL, 10, NULL);
+    xTaskCreate(root_udp_to_uart_task, "root_udp_to_uart", 4096, NULL, 10, NULL);
+#else
+    xTaskCreate(leaf_uart_to_udp_task, "leaf_uart_to_udp", 4096, NULL, 10, NULL);
 #endif
 
-    xTaskCreate(sysinfo_task,
-                "sysinfo",
-                4096, NULL, 5, &sysinfo_task_h);
+    xTaskCreate(sysinfo_task, "sysinfo", 4096, NULL, 5, &sysinfo_task_h);
 
     TimerHandle_t t = xTimerCreate("sysinfo_timer",
                                    pdMS_TO_TICKS(10000),
