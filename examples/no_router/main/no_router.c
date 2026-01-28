@@ -18,7 +18,7 @@
 #include <inttypes.h>
 #include <string.h>
 #include <ctype.h>
-#include <errno.h>   // ✅ FIX: to log sendto() errno
+#include <errno.h>
 
 #include "esp_log.h"
 #include "esp_system.h"
@@ -133,6 +133,12 @@ static void wifi_init(void)
             .ssid = CONFIG_BRIDGE_SOFTAP_SSID,
             .password = CONFIG_BRIDGE_SOFTAP_PASSWORD,
             .channel = CONFIG_MESH_CHANNEL,
+
+            // ✅ FIX: stop SA Query / reason 209 disconnect loops by disabling PMF on SoftAP
+            .pmf_cfg = {
+                .capable  = false,
+                .required = false,
+            },
         },
     };
 
@@ -283,7 +289,7 @@ static void leaf_udp_init_when_ready(void)
              inet_ntoa(root_addr.sin_addr), CONFIG_UDP_PORT);
 }
 
-// ✅ FIX: central helper to reset/re-resolve UDP target after parent changes
+// Reset/re-resolve UDP target after parent changes
 static void leaf_udp_reset_and_reresolve(void)
 {
     if (leaf_udp_sock >= 0) {
@@ -291,7 +297,6 @@ static void leaf_udp_reset_and_reresolve(void)
         leaf_udp_sock = -1;
     }
 
-    // Re-resolve current GW/root target (handles re-parenting / IP change)
     while (leaf_udp_sock < 0) {
         leaf_udp_init_when_ready();
         if (leaf_udp_sock >= 0) break;
@@ -304,7 +309,6 @@ static void leaf_uart_to_udp_task(void *arg)
     (void)arg;
     const uart_port_t U = UART_NUM_1;
 
-    // initial init
     leaf_udp_reset_and_reresolve();
 
     static uint8_t line[CONFIG_MAX_LINE_LEN + 2];
@@ -329,11 +333,8 @@ static void leaf_uart_to_udp_task(void *arg)
                 int sent = sendto(leaf_udp_sock, line, len, 0,
                                   (struct sockaddr *)&root_addr, sizeof(root_addr));
                 if (sent < 0) {
-                    // ✅ FIX: if parent/gateway changed, UDP target becomes stale
                     ESP_LOGW(TAG, "Leaf: sendto failed; resetting UDP target (errno=%d)", errno);
                     leaf_udp_reset_and_reresolve();
-
-                    // optional: try once more immediately
                     (void)sendto(leaf_udp_sock, line, len, 0,
                                  (struct sockaddr *)&root_addr, sizeof(root_addr));
                 }
@@ -343,7 +344,6 @@ static void leaf_uart_to_udp_task(void *arg)
             }
 
             if (!is_allowed_ascii(c)) {
-                // noise/binary: drop partial line
                 len = 0;
                 continue;
             }
@@ -351,7 +351,6 @@ static void leaf_uart_to_udp_task(void *arg)
             if (len < (size_t)CONFIG_MAX_LINE_LEN) {
                 line[len++] = c;
             } else {
-                // oversized: drop line
                 len = 0;
             }
         }
@@ -420,21 +419,24 @@ void app_main(void)
     esp_bridge_create_all_netif();
     wifi_init();
 
+    // ✅ FIX: force HT20 bandwidth (reduces channel-width churn / instability)
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20));
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
+
     esp_mesh_lite_config_t cfg = ESP_MESH_LITE_DEFAULT_INIT();
     cfg.join_mesh_ignore_router_status = true;
     cfg.join_mesh_without_configured_wifi = true;
 
     esp_mesh_lite_init(&cfg);
 
-    // ✅ FIX: disable Wi-Fi power save (reduces beacon timeouts / re-parent churn)
+    // ✅ FIX: disable Wi-Fi power save
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
 #if CONFIG_MESH_ROOT
-    // ✅ FIX: force ROOT AP-only (prevents esp_bridge/STA weirdness in no_router)
+    // ✅ FIX: force ROOT AP-only
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
 #endif
 
-    // Apply no_router policy BEFORE start
     mesh_no_router_policy_apply();
 
     app_wifi_set_softap_info();
