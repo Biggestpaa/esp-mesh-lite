@@ -19,6 +19,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <stdbool.h>
 
 #include "esp_log.h"
 #include "esp_system.h"
@@ -48,6 +49,67 @@
 static const char *TAG = "no_router_uart_udp";
 
 /* ============================================================
+ * WATCHDOGS 1–4 (NO HW WDT)
+ * ============================================================ */
+
+/* ---- Tunables (conservative defaults) ---- */
+#define WD_BOOT_GRACE_MS                 (30 * 1000)   // no resets for first 60s after boot
+#define WD_RESET_MIN_INTERVAL_MS         (1 * 60 * 1000) // minimum 5 minutes between resets
+
+#define WD_LEAF_NO_PARENT_MS             (30 * 1000)  // leaf: no parent for 2 minutes => reset
+#define WD_ROOT_NO_CHILD_MS              (30 * 1000)  // root: no children for 3 minutes => reset
+
+#define WD_TASK_HEARTBEAT_TIMEOUT_MS     (45 * 1000)   // if task heartbeat stale => reset
+#define WD_HEAP_FLOOR_BYTES              (50 * 1024)   // heap below 60KB => reset
+
+#define WD_UDP_FAIL_WINDOW_MS            (60 * 1000)   // count UDP fails over last 60s
+#define WD_UDP_FAIL_THRESHOLD            (20)          // >= 20 fails in 60s => reset (leaf only)
+
+/* ---- State ---- */
+static uint32_t wd_boot_ms = 0;
+static uint32_t wd_last_reset_attempt_ms = 0;
+
+static uint32_t wd_last_parent_ok_ms = 0;   // leaf
+static uint32_t wd_last_child_ok_ms = 0;    // root
+
+static uint32_t wd_leaf_task_hb_ms = 0;
+static uint32_t wd_root_task_hb_ms = 0;
+
+/* UDP fail tracking (leaf) */
+static uint32_t wd_udp_fail_window_start_ms = 0;
+static uint32_t wd_udp_fail_count_in_window = 0;
+
+/* ---- Helpers ---- */
+static inline bool wd_in_boot_grace(uint32_t now_ms)
+{
+    return (now_ms - wd_boot_ms) < WD_BOOT_GRACE_MS;
+}
+
+static inline bool wd_reset_rate_limited(uint32_t now_ms)
+{
+    return (now_ms - wd_last_reset_attempt_ms) < WD_RESET_MIN_INTERVAL_MS;
+}
+
+static void wd_request_reset(const char *reason)
+{
+    uint32_t now = esp_log_timestamp();
+
+    if (wd_in_boot_grace(now)) {
+        ESP_LOGW(TAG, "WATCHDOG: would reset (%s) but still in boot grace", reason);
+        return;
+    }
+    if (wd_reset_rate_limited(now)) {
+        ESP_LOGW(TAG, "WATCHDOG: would reset (%s) but rate-limited", reason);
+        return;
+    }
+
+    wd_last_reset_attempt_ms = now;
+    ESP_LOGE(TAG, "WATCHDOG RESET: %s", reason);
+    fflush(stdout);
+    esp_restart();
+}
+
+/* ============================================================
  * SYSTEM INFO (runs in normal task, NOT timer task)
  * ============================================================ */
 
@@ -65,6 +127,8 @@ static void sysinfo_task(void *arg)
 
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        uint32_t now = esp_log_timestamp();
 
         if (esp_mesh_lite_get_level() > 1) {
             (void)esp_wifi_sta_get_ap_info(&ap_info);
@@ -89,6 +153,78 @@ static void sysinfo_task(void *arg)
         for (int i = 0; i < wifi_sta_list.num; i++) {
             ESP_LOGI(TAG, "Child mac: " MACSTR,
                      MAC2STR(wifi_sta_list.sta[i].mac));
+        }
+
+        /* ========================================================
+         * WATCHDOG INPUTS
+         * ======================================================== */
+
+#if CONFIG_MESH_ROOT
+        /* ROOT: if we have any children connected, we are "healthy" */
+        if (wifi_sta_list.num > 0) {
+            wd_last_child_ok_ms = now;
+        }
+
+        /* ROOT task heartbeat must be recent */
+        if (!wd_in_boot_grace(now)) {
+            if ((now - wd_root_task_hb_ms) > WD_TASK_HEARTBEAT_TIMEOUT_MS) {
+                wd_request_reset("ROOT task heartbeat timeout");
+            }
+        }
+
+        /* ROOT: no children for too long => reset */
+        if (!wd_in_boot_grace(now)) {
+            if ((now - wd_last_child_ok_ms) > WD_ROOT_NO_CHILD_MS) {
+                wd_request_reset("ROOT no children timeout");
+            }
+        }
+
+#else
+        /* LEAF: parent bssid non-zero indicates attached to an AP */
+        bool has_parent = false;
+        for (int i = 0; i < 6; i++) {
+            if (ap_info.bssid[i] != 0) { has_parent = true; break; }
+        }
+        if (has_parent) {
+            wd_last_parent_ok_ms = now;
+        }
+
+        /* LEAF task heartbeat must be recent */
+        if (!wd_in_boot_grace(now)) {
+            if ((now - wd_leaf_task_hb_ms) > WD_TASK_HEARTBEAT_TIMEOUT_MS) {
+                wd_request_reset("LEAF task heartbeat timeout");
+            }
+        }
+
+        /* LEAF: no parent for too long => reset */
+        if (!wd_in_boot_grace(now)) {
+            if ((now - wd_last_parent_ok_ms) > WD_LEAF_NO_PARENT_MS) {
+                wd_request_reset("LEAF no parent timeout");
+            }
+        }
+
+        /* LEAF: UDP failure window check */
+        if (!wd_in_boot_grace(now)) {
+            if (wd_udp_fail_window_start_ms == 0) {
+                wd_udp_fail_window_start_ms = now;
+                wd_udp_fail_count_in_window = 0;
+            } else if ((now - wd_udp_fail_window_start_ms) > WD_UDP_FAIL_WINDOW_MS) {
+                /* roll window */
+                wd_udp_fail_window_start_ms = now;
+                wd_udp_fail_count_in_window = 0;
+            }
+
+            if (wd_udp_fail_count_in_window >= WD_UDP_FAIL_THRESHOLD) {
+                wd_request_reset("LEAF excessive UDP send failures");
+            }
+        }
+#endif
+
+        /* Heap floor watchdog (both roles) */
+        if (!wd_in_boot_grace(now)) {
+            if (esp_get_free_heap_size() < WD_HEAP_FLOOR_BYTES) {
+                wd_request_reset("Heap below floor");
+            }
         }
     }
 }
@@ -234,14 +370,18 @@ static void mesh_no_router_policy_apply(void)
 }
 
 /* ============================================================
- * LEAF: UART -> UDP (to ROOT)
+ * PACKET SIZE / LINE LIMIT (shared by ROOT + LEAF)
  * ============================================================ */
-
-#if !CONFIG_MESH_ROOT
 
 #ifndef CONFIG_MAX_LINE_LEN
 #define CONFIG_MAX_LINE_LEN 128
 #endif
+
+/* ============================================================
+ * LEAF: UART -> UDP (to ROOT)
+ * ============================================================ */
+
+#if !CONFIG_MESH_ROOT
 
 static int leaf_udp_sock = -1;
 static struct sockaddr_in root_addr;
@@ -317,6 +457,9 @@ static void leaf_uart_to_udp_task(void *arg)
     uint8_t rx[256];
 
     for (;;) {
+        /* Task heartbeat for watchdog */
+        wd_leaf_task_hb_ms = esp_log_timestamp();
+
         int n = uart_read_bytes(U, rx, sizeof(rx), pdMS_TO_TICKS(100));
         if (n <= 0) continue;
 
@@ -334,9 +477,33 @@ static void leaf_uart_to_udp_task(void *arg)
                                   (struct sockaddr *)&root_addr, sizeof(root_addr));
                 if (sent < 0) {
                     ESP_LOGW(TAG, "Leaf: sendto failed; resetting UDP target (errno=%d)", errno);
+
+                    /* Count failure in watchdog window */
+                    uint32_t now = esp_log_timestamp();
+                    if (wd_udp_fail_window_start_ms == 0) {
+                        wd_udp_fail_window_start_ms = now;
+                        wd_udp_fail_count_in_window = 0;
+                    }
+                    if ((now - wd_udp_fail_window_start_ms) > WD_UDP_FAIL_WINDOW_MS) {
+                        wd_udp_fail_window_start_ms = now;
+                        wd_udp_fail_count_in_window = 0;
+                    }
+                    wd_udp_fail_count_in_window++;
+
                     leaf_udp_reset_and_reresolve();
                     (void)sendto(leaf_udp_sock, line, len, 0,
                                  (struct sockaddr *)&root_addr, sizeof(root_addr));
+                } else {
+                    /* On success, slowly forgive by resetting window if quiet */
+                    uint32_t now = esp_log_timestamp();
+                    if (wd_udp_fail_window_start_ms == 0) {
+                        wd_udp_fail_window_start_ms = now;
+                        wd_udp_fail_count_in_window = 0;
+                    }
+                    if ((now - wd_udp_fail_window_start_ms) > WD_UDP_FAIL_WINDOW_MS) {
+                        wd_udp_fail_window_start_ms = now;
+                        wd_udp_fail_count_in_window = 0;
+                    }
                 }
 
                 len = 0;
@@ -395,6 +562,9 @@ static void root_udp_to_uart_task(void *arg)
     uint8_t buf[CONFIG_MAX_LINE_LEN + 2];
 
     for (;;) {
+        /* Task heartbeat for watchdog */
+        wd_root_task_hb_ms = esp_log_timestamp();
+
         int n = recvfrom(sock, buf, sizeof(buf), 0, NULL, NULL);
         if (n > 0) {
             uart_write_bytes(U, (const char *)buf, n);
@@ -411,6 +581,19 @@ static void root_udp_to_uart_task(void *arg)
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_INFO);
+
+    /* Watchdog init */
+    wd_boot_ms = esp_log_timestamp();
+    wd_last_reset_attempt_ms = 0;
+
+    wd_last_parent_ok_ms = wd_boot_ms;
+    wd_last_child_ok_ms  = wd_boot_ms;
+
+    wd_leaf_task_hb_ms = wd_boot_ms;
+    wd_root_task_hb_ms = wd_boot_ms;
+
+    wd_udp_fail_window_start_ms = 0;
+    wd_udp_fail_count_in_window = 0;
 
     ESP_ERROR_CHECK(esp_storage_init());
     ESP_ERROR_CHECK(esp_netif_init());
