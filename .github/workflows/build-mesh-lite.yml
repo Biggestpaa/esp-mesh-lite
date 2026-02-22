@@ -59,6 +59,33 @@ jobs:
           idf.py build
           idf.py merge-bin
 
+      - name: Dump build logs on failure
+        if: failure()
+        run: |
+          cd examples/no_router
+          echo "=== Build log dir ==="
+          ls -lah build/log || true
+
+          echo "=== STDERR logs (first 300 lines each) ==="
+          for f in build/log/idf_py_stderr_output_*; do
+            echo "----- $f -----"
+            sed -n '1,300p' "$f" || true
+            echo
+          done
+
+          echo "=== STDOUT logs (first 300 lines each) ==="
+          for f in build/log/idf_py_stdout_output_*; do
+            echo "----- $f -----"
+            sed -n '1,300p' "$f" || true
+            echo
+          done
+
+          echo "=== CMakeError/CMakeOutput if present ==="
+          find build -maxdepth 3 -type f \( -name "CMakeError.log" -o -name "CMakeOutput.log" \) -print -exec sed -n '1,300p' {} \; || true
+
+          echo "=== Ninja verbose (if build.ninja exists) ==="
+          test -f build/build.ninja && (cd build && ninja -v -k 0) || true
+
       - name: Collect artifacts
         run: |
           OUT="artifacts_${{ matrix.role }}"
