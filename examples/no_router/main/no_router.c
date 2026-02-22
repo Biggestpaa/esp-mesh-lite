@@ -38,6 +38,7 @@
 
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#include "lwip/ip_addr.h"   // ✅ needed for esp_ip_addr_t + IPADDR_TYPE_V4 + ip_2_ip4()
 
 #include "driver/uart.h"
 
@@ -360,19 +361,30 @@ static inline bool is_allowed_ascii(uint8_t c)
     return (c >= 32 && c <= 126);
 }
 
+/* ✅ FIXED for your Mesh-Lite release:
+ * esp_mesh_lite_get_root_ip(uint8_t type, esp_ip_addr_t *ip_addr)
+ */
 static bool get_root_ip_u32(uint32_t *out_addr)
 {
     if (!out_addr) return false;
 
-    esp_ip4_addr_t root_ip;
-    root_ip.addr = 0;
+    esp_ip_addr_t ip;
+    memset(&ip, 0, sizeof(ip));
 
-    esp_err_t err = esp_mesh_lite_get_root_ip(&root_ip);
-    if (err != ESP_OK || root_ip.addr == 0) {
+    esp_err_t err = esp_mesh_lite_get_root_ip(IPADDR_TYPE_V4, &ip);
+    if (err != ESP_OK) {
+        return false;
+    }
+    if (ip.type != IPADDR_TYPE_V4) {
         return false;
     }
 
-    *out_addr = root_ip.addr;
+    uint32_t addr = ip_2_ip4(&ip)->addr;  // lwIP stored form (network order)
+    if (addr == 0) {
+        return false;
+    }
+
+    *out_addr = addr;
     return true;
 }
 
@@ -590,8 +602,8 @@ void app_main(void)
     ESP_LOGI(TAG, "Role: ROOT");
     esp_mesh_lite_set_allowed_level(1);
 #else
-    // ✅ IMPORTANT: do NOT force “leaf-only” behaviour.
-    // Leaving level unrestricted allows these nodes to become intermediate parents when needed.
+    // ✅ IMPORTANT: do NOT force leaf-only behaviour.
+    // Leaving level unrestricted allows nodes to act as intermediate parents for rerouting.
     ESP_LOGI(TAG, "Role: NODE");
 #endif
 
