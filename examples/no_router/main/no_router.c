@@ -38,7 +38,7 @@
 
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
-#include "lwip/ip_addr.h"   // ✅ needed for esp_ip_addr_t + IPADDR_TYPE_V4 + ip_2_ip4()
+#include "lwip/ip_addr.h"   // esp_ip_addr_t + IPADDR_TYPE_V4 + ip_2_ip4()
 
 #include "driver/uart.h"
 
@@ -361,7 +361,7 @@ static inline bool is_allowed_ascii(uint8_t c)
     return (c >= 32 && c <= 126);
 }
 
-/* ✅ FIXED for your Mesh-Lite release:
+/*
  * esp_mesh_lite_get_root_ip(uint8_t type, esp_ip_addr_t *ip_addr)
  */
 static bool get_root_ip_u32(uint32_t *out_addr)
@@ -379,7 +379,7 @@ static bool get_root_ip_u32(uint32_t *out_addr)
         return false;
     }
 
-    uint32_t addr = ip_2_ip4(&ip)->addr;  // lwIP stored form (network order)
+    uint32_t addr = ip_2_ip4(&ip)->addr;  // lwIP stored form (often host-order in some builds)
     if (addr == 0) {
         return false;
     }
@@ -405,7 +405,9 @@ static void node_udp_init_when_ready(void)
     memset(&root_addr, 0, sizeof(root_addr));
     root_addr.sin_family = AF_INET;
     root_addr.sin_port = htons(CONFIG_UDP_PORT);
-    root_addr.sin_addr.s_addr = root_ip_u32; // ✅ ROOT IP from Mesh-Lite
+
+    // ✅ FIX: ensure correct byte order for sockaddr_in
+    root_addr.sin_addr.s_addr = htonl(root_ip_u32);
 
     node_udp_sock = s;
 
@@ -602,8 +604,6 @@ void app_main(void)
     ESP_LOGI(TAG, "Role: ROOT");
     esp_mesh_lite_set_allowed_level(1);
 #else
-    // ✅ IMPORTANT: do NOT force leaf-only behaviour.
-    // Leaving level unrestricted allows nodes to act as intermediate parents for rerouting.
     ESP_LOGI(TAG, "Role: NODE");
 #endif
 
