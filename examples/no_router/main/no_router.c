@@ -629,7 +629,7 @@ void app_main(void)
     esp_mesh_lite_set_allowed_level(1);
 #else
     ESP_LOGI(TAG, "Role: LEAF");
-    esp_mesh_lite_set_disallowed_level(1);
+    esp_mesh_lite_set_disallowed_level(10);
 #endif
 
     esp_mesh_lite_start();
