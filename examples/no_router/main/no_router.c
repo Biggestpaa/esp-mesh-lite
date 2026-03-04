@@ -10,8 +10,12 @@
  * NO ROUTER / NO INTERNET
  *
  * FIXES + IMPROVEMENTS:
- *   FIX: Correct ROOT IP handling (no byte-swap / no lwIP ip_2_ip4 misuse).
- *        Your log showed 1.5.168.192; this fixes it to 192.168.5.1 etc.
+ *   FIX: Root IP endianness ambiguity across builds.
+ *        Some Mesh-Lite/IDF combos return esp_ip_addr_t.u_addr.ip4.addr in the
+ *        opposite byte order to what lwIP expects for sockaddr_in.
+ *        Symptom: NODE UDP target prints "1.5.168.192" instead of "192.168.5.1".
+ *        Fix: Try both orders (as-is and htonl()) and pick the one that matches
+ *        the mesh subnet (default: 192.168.*.*).
  *
  *   A) Throttle fast reconnect actions (cooldown) to avoid thrash on repeated disconnect events
  *   B) Faster reconnect backoff cap (max 8s) so it doesn't drift to 30s intervals
@@ -20,6 +24,9 @@
  * - Root is forced AP-only after Mesh-Lite init to prevent STA connect spam in no_router mode.
  * - set_router_config(empty) sometimes returns ESP_FAIL on ROOT in some Mesh-Lite builds;
  *   we log it but do not abort.
+ *
+ * UART framing (LOCKED RULES):
+ * - line-based, ASCII, each event is one line terminated by '\n'
  */
 
 #include <inttypes.h>
@@ -446,11 +453,19 @@ static inline bool is_allowed_ascii(uint8_t c)
     return (c >= 32 && c <= 126);
 }
 
+/* Decide if IP string is a sane mesh LAN IPv4 (default expects 192.168.*.*) */
+static bool looks_like_mesh_lan_ipv4(const char *ipstr)
+{
+    if (!ipstr) return false;
+    return (strncmp(ipstr, "192.168.", 8) == 0);
+}
+
 /*
- * FIX: Correctly read IPv4 from esp_ip_addr_t (ESP-IDF type),
- * without lwIP ip_2_ip4() which expects lwIP ip_addr_t.
- *
- * esp_ip_addr_t.u_addr.ip4.addr is already in network byte order.
+ * FIX: Root IP endianness ambiguity.
+ * We test two candidates:
+ *  - A: ip.u_addr.ip4.addr as returned
+ *  - B: htonl(A) (byte-swapped)
+ * and choose the one that matches expected mesh LAN prefix.
  */
 static bool get_root_ip_u32(uint32_t *out_addr_net_order)
 {
@@ -463,10 +478,34 @@ static bool get_root_ip_u32(uint32_t *out_addr_net_order)
     if (err != ESP_OK) return false;
     if (ip.type != IPADDR_TYPE_V4) return false;
 
-    uint32_t a = ip.u_addr.ip4.addr;  /* network order */
+    uint32_t a = ip.u_addr.ip4.addr;
     if (a == 0) return false;
 
-    *out_addr_net_order = a;
+    struct in_addr ia1 = { .s_addr = a };
+    char s1[16] = {0};
+    inet_ntoa_r(ia1, s1, sizeof(s1));
+
+    uint32_t b = htonl(a);
+    struct in_addr ia2 = { .s_addr = b };
+    char s2[16] = {0};
+    inet_ntoa_r(ia2, s2, sizeof(s2));
+
+    bool s1_ok = looks_like_mesh_lan_ipv4(s1);
+    bool s2_ok = looks_like_mesh_lan_ipv4(s2);
+
+    uint32_t chosen = 0;
+
+    if (s1_ok && !s2_ok) chosen = a;
+    else if (!s1_ok && s2_ok) chosen = b;
+    else {
+        /* Fallback:
+         * Your observed broken case is s1="1.5.168.192" and s2="192.168.5.1",
+         * so prefer swapped if ambiguous.
+         */
+        chosen = b;
+    }
+
+    *out_addr_net_order = chosen;
     return true;
 }
 
