@@ -15,7 +15,9 @@
  *   2) force a short scan
  *   3) reconnect immediately
  *
- * This typically cuts “self-heal” time to single-digit seconds if another parent exists.
+ * IMPROVEMENTS ADDED (the 2 you asked for):
+ *   A) Throttle fast reconnect actions (cooldown) to avoid thrash on repeated disconnect events
+ *   B) Faster reconnect backoff cap (max 8s) so it doesn't drift to 30s intervals
  */
 
 #include <inttypes.h>
@@ -56,7 +58,7 @@ static const char *TAG = "no_router_uart_udp";
 #define WD_RESET_MIN_INTERVAL_MS         (60 * 1000)
 
 /* Make these LESS aggressive. We now actively reconnect instead of rebooting. */
-#define WD_LEAF_NO_PARENT_MS             (180 * 1000)   // was 30s; too aggressive
+#define WD_LEAF_NO_PARENT_MS             (180 * 1000)
 #define WD_ROOT_NO_CHILD_MS              (300 * 1000)
 
 #define WD_TASK_HEARTBEAT_TIMEOUT_MS     (60 * 1000)
@@ -330,8 +332,12 @@ static void mesh_no_router_policy_apply(void)
              esp_err_to_name(err),
              (mode == ESP_MESH_LITE_MESH) ? "MESH" : "ROUTER");
 
-    /* Keep reconnect attempts frequent */
-    esp_mesh_lite_set_wifi_reconnect_interval(1, 30, 3);
+    /*
+     * IMPROVEMENT B:
+     * Keep reconnect attempts frequent and cap backoff to single digits.
+     * (was 1,30,3)
+     */
+    esp_mesh_lite_set_wifi_reconnect_interval(1, 8, 2);
 }
 
 /* ============================================================
@@ -349,25 +355,36 @@ static void mesh_no_router_policy_apply(void)
 #if !CONFIG_MESH_ROOT
 
 static TaskHandle_t fast_reconnect_task_h = NULL;
-static volatile uint32_t last_disc_ms = 0;
+
+/*
+ * IMPROVEMENT A:
+ * Throttle the fast reconnect sequence to avoid thrashing when
+ * multiple DISCONNECTED events arrive close together.
+ */
+#define FAST_RECONNECT_COOLDOWN_MS 1500
 
 static void fast_reconnect_task(void *arg)
 {
     (void)arg;
+    static uint32_t last_run_ms = 0;
 
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        /* Small coalesce delay so multiple DISCONNECTED events don't thrash */
+        /* Coalesce tiny bursts of disconnect events */
         vTaskDelay(pdMS_TO_TICKS(150));
 
         uint32_t now = esp_log_timestamp();
+        if (now - last_run_ms < FAST_RECONNECT_COOLDOWN_MS) {
+            continue;
+        }
+        last_run_ms = now;
 
         /* Stop Mesh-Lite from wasting time on the old parent hint */
         esp_err_t e1 = esp_mesh_lite_erase_rtc_store();
         ESP_LOGW(TAG, "FAST-RECONNECT: erase_rtc_store -> %s", esp_err_to_name(e1));
 
-        /* Force a scan quickly (helps find alternate parent faster) */
+        /* Force a quick scan to find alternate parent sooner */
         esp_err_t e2 = esp_mesh_lite_wifi_scan_start(NULL, 2500);
         ESP_LOGW(TAG, "FAST-RECONNECT: wifi_scan_start(2500ms) -> %s", esp_err_to_name(e2));
 
@@ -375,9 +392,6 @@ static void fast_reconnect_task(void *arg)
         (void)esp_wifi_disconnect();
         esp_err_t e3 = esp_wifi_connect();
         ESP_LOGW(TAG, "FAST-RECONNECT: esp_wifi_connect -> %s", esp_err_to_name(e3));
-
-        /* Update watchdog “parent ok” time if we reconnect quickly */
-        (void)now;
     }
 }
 
@@ -386,10 +400,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     (void)arg; (void)data;
 
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        uint32_t now = esp_log_timestamp();
-        last_disc_ms = now;
-
-        /* Trigger fast reconnect task (non-blocking) */
         if (fast_reconnect_task_h) {
             xTaskNotifyGive(fast_reconnect_task_h);
         }
