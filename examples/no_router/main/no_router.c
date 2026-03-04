@@ -15,7 +15,7 @@
  *   2) force a short scan
  *   3) reconnect immediately
  *
- * IMPROVEMENTS ADDED (the 2 you asked for):
+ * IMPROVEMENTS ADDED:
  *   A) Throttle fast reconnect actions (cooldown) to avoid thrash on repeated disconnect events
  *   B) Faster reconnect backoff cap (max 8s) so it doesn't drift to 30s intervals
  */
@@ -24,6 +24,7 @@
 #include <string.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -57,7 +58,7 @@ static const char *TAG = "no_router_uart_udp";
 #define WD_BOOT_GRACE_MS                 (30 * 1000)
 #define WD_RESET_MIN_INTERVAL_MS         (60 * 1000)
 
-/* Make these LESS aggressive. We now actively reconnect instead of rebooting. */
+/* Less aggressive; we reconnect instead of rebooting fast */
 #define WD_LEAF_NO_PARENT_MS             (180 * 1000)
 #define WD_ROOT_NO_CHILD_MS              (300 * 1000)
 
@@ -110,6 +111,16 @@ static void wd_request_reset(const char *reason)
 }
 
 /* ============================================================
+ * MAC formatting helper (avoids MACSTR/MAC2STR format warnings)
+ * ============================================================ */
+
+static inline void mac_to_str(const uint8_t mac[6], char out[18])
+{
+    snprintf(out, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+/* ============================================================
  * SYSTEM INFO (runs in normal task, NOT timer task)
  * ============================================================ */
 
@@ -124,6 +135,9 @@ static void sysinfo_task(void *arg)
     wifi_ap_record_t ap_info = {0};
     wifi_second_chan_t second = 0;
     wifi_sta_list_t wifi_sta_list = {0};
+
+    char self_mac_s[18];
+    char parent_mac_s[18];
 
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -140,18 +154,22 @@ static void sysinfo_task(void *arg)
         (void)esp_wifi_ap_get_sta_list(&wifi_sta_list);
         (void)esp_wifi_get_channel(&primary, &second);
 
+        mac_to_str(sta_mac, self_mac_s);
+        mac_to_str(ap_info.bssid, parent_mac_s);
+
         ESP_LOGI(TAG,
-                 "System info, ch=%d layer=%d self=" MACSTR
-                 " parent=" MACSTR " parent_rssi=%d free_heap=%" PRIu32,
-                 primary,
+                 "System info, ch=%u layer=%d self=%s parent=%s parent_rssi=%d free_heap=%" PRIu32,
+                 (unsigned)primary,
                  esp_mesh_lite_get_level(),
-                 MAC2STR(sta_mac),
-                 MAC2STR(ap_info.bssid),
+                 self_mac_s,
+                 parent_mac_s,
                  (ap_info.rssi != 0 ? ap_info.rssi : -120),
-                 esp_get_free_heap_size());
+                 (uint32_t)esp_get_free_heap_size());
 
         for (int i = 0; i < wifi_sta_list.num; i++) {
-            ESP_LOGI(TAG, "Child mac: " MACSTR, MAC2STR(wifi_sta_list.sta[i].mac));
+            char child_s[18];
+            mac_to_str(wifi_sta_list.sta[i].mac, child_s);
+            ESP_LOGI(TAG, "Child mac: %s", child_s);
         }
 
 #if CONFIG_MESH_ROOT
@@ -334,8 +352,7 @@ static void mesh_no_router_policy_apply(void)
 
     /*
      * IMPROVEMENT B:
-     * Keep reconnect attempts frequent and cap backoff to single digits.
-     * (was 1,30,3)
+     * Frequent reconnect attempts; cap backoff to single digits
      */
     esp_mesh_lite_set_wifi_reconnect_interval(1, 8, 2);
 }
@@ -380,9 +397,12 @@ static void fast_reconnect_task(void *arg)
         }
         last_run_ms = now;
 
-        /* Stop Mesh-Lite from wasting time on the old parent hint */
-        esp_err_t e1 = esp_mesh_lite_erase_rtc_store();
-        ESP_LOGW(TAG, "FAST-RECONNECT: erase_rtc_store -> %s", esp_err_to_name(e1));
+        /*
+         * NOTE: In your Mesh-Lite version this returns void (not esp_err_t)
+         * so don't assign it.
+         */
+        esp_mesh_lite_erase_rtc_store();
+        ESP_LOGW(TAG, "FAST-RECONNECT: erase_rtc_store done");
 
         /* Force a quick scan to find alternate parent sooner */
         esp_err_t e2 = esp_mesh_lite_wifi_scan_start(NULL, 2500);
@@ -665,7 +685,6 @@ void app_main(void)
 
     /* FAST reconnect infra */
     xTaskCreate(fast_reconnect_task, "fast_reconnect", 4096, NULL, 12, &fast_reconnect_task_h);
-
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
 #endif
 
