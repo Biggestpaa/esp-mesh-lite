@@ -1,8 +1,8 @@
 /*
- * ESP-Mesh-Lite "no_router" + UART<->UDP bridge
+ * ESP-Mesh-Lite "no_router" UART <-> UDP bridge (multihop-safe)
  *
- * NODE (non-root):
- *   UART -> UDP -> ROOT
+ * NODE:
+ *   UART -> UDP -> ROOT   (target = STA gateway IP; works for multihop)
  *
  * ROOT:
  *   UDP -> UART
@@ -10,307 +10,109 @@
  * NO ROUTER / NO INTERNET
  *
  * FIXES + IMPROVEMENTS:
- *   FIX: Root IP endianness ambiguity across builds.
- *        Some Mesh-Lite/IDF combos return esp_ip_addr_t.u_addr.ip4.addr in the
- *        opposite byte order to what lwIP expects for sockaddr_in.
- *        Symptom: NODE UDP target prints "1.5.168.192" instead of "192.168.5.1".
- *        Fix: Try both orders (as-is and htonl()) and pick the one that matches
- *        the mesh subnet (default: 192.168.*.*).
+ *  1) Correct ROOT targeting:
+ *     - Do NOT use esp_mesh_lite_get_root_ip() (can be 0 or endian-trappy depending on build)
+ *     - Instead: send UDP to STA gateway (parent) IP; Mesh-Lite routes toward root.
  *
- *   A) Throttle fast reconnect actions (cooldown) to avoid thrash on repeated disconnect events
- *   B) Faster reconnect backoff cap (max 8s) so it doesn't drift to 30s intervals
+ *  2) DHCP/IP-change safe:
+ *     - On IP_EVENT_STA_GOT_IP or IP_EVENT_STA_LOST_IP: rebuild UDP socket/target.
+ *     - On WIFI disconnect: clear readiness and rebuild later.
  *
- * Notes:
- * - Root is forced AP-only after Mesh-Lite init to prevent STA connect spam in no_router mode.
- * - set_router_config(empty) sometimes returns ESP_FAIL on ROOT in some Mesh-Lite builds;
- *   we log it but do not abort.
+ *  3) Scale improvement (25 rooms / 2000 tags):
+ *     - Batch multiple UART lines into a single UDP datagram (still newline-delimited).
+ *       This massively reduces packets/sec and drop probability.
+ *     - Increase UART RX buffer and keep a fast parse/send task.
  *
- * UART framing (LOCKED RULES):
- * - line-based, ASCII, each event is one line terminated by '\n'
+ *  4) Quick reconnect (NODE):
+ *     - On STA_DISCONNECTED:
+ *         cooldown -> erase Mesh-Lite RTC parent hint -> short scan -> reconnect now.
  */
 
-#include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <stdbool.h>
-#include <stdio.h>
+#include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/timers.h"
+#include "freertos/event_groups.h"
 
 #include "esp_log.h"
-#include "esp_system.h"
 #include "esp_err.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "nvs_flash.h"
 
+#include "driver/uart.h"
+
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
-#include "lwip/ip_addr.h"   // IPADDR_TYPE_V4
-
-#include "driver/uart.h"
 
 #include "esp_bridge.h"
 #include "esp_mesh_lite.h"
-#include "esp_mesh_lite_core.h"
-#include "esp_mesh_lite_port.h"
+
+/* ============================ USER CONFIG ============================ */
+
+#ifndef CONFIG_UDP_PORT
+#define CONFIG_UDP_PORT 4510
+#endif
+
+#ifndef CONFIG_MAX_LINE_LEN
+#define CONFIG_MAX_LINE_LEN 128
+#endif
+
+/* Bigger UART RX buffer helps avoid overflow when scanners burst */
+#ifndef CONFIG_UART_RX_BUF
+#define CONFIG_UART_RX_BUF (16 * 1024)
+#endif
+
+/* UDP batching target size (stay well below MTU) */
+#ifndef CONFIG_UDP_BATCH_MAX
+#define CONFIG_UDP_BATCH_MAX 1200
+#endif
+
+/* Flush batch if no new line for this long */
+#ifndef CONFIG_UDP_BATCH_FLUSH_MS
+#define CONFIG_UDP_BATCH_FLUSH_MS 10
+#endif
+
+/* Socket send buffer (best-effort; lwIP may clamp) */
+#ifndef CONFIG_UDP_SNDBUF
+#define CONFIG_UDP_SNDBUF (32 * 1024)
+#endif
 
 static const char *TAG = "no_router_uart_udp";
 
-/* ============================================================
- * WATCHDOGS (soft reset only)
- * ============================================================ */
+/* ============================ GLOBALS ============================ */
 
-#define WD_BOOT_GRACE_MS                 (30 * 1000)
-#define WD_RESET_MIN_INTERVAL_MS         (60 * 1000)
+static EventGroupHandle_t g_evt;
+#define EVT_STA_HAS_IP      (1U << 0)
+#define EVT_REBUILD_TARGET  (1U << 1)
 
-/* Less aggressive; we reconnect instead of rebooting fast */
-#define WD_LEAF_NO_PARENT_MS             (180 * 1000)
-#define WD_ROOT_NO_CHILD_MS              (300 * 1000)
-
-#define WD_TASK_HEARTBEAT_TIMEOUT_MS     (60 * 1000)
-#define WD_HEAP_FLOOR_BYTES              (50 * 1024)
-
-#define WD_UDP_FAIL_WINDOW_MS            (60 * 1000)
-#define WD_UDP_FAIL_THRESHOLD            (20)
-
-static uint32_t wd_boot_ms = 0;
-static uint32_t wd_last_reset_attempt_ms = 0;
-
-static uint32_t wd_last_parent_ok_ms = 0;   // node
-static uint32_t wd_last_child_ok_ms = 0;    // root
-
-static uint32_t wd_leaf_task_hb_ms = 0;
-static uint32_t wd_root_task_hb_ms = 0;
-
-/* UDP fail tracking (node) */
-static uint32_t wd_udp_fail_window_start_ms = 0;
-static uint32_t wd_udp_fail_count_in_window = 0;
-
-static inline bool wd_in_boot_grace(uint32_t now_ms)
-{
-    return (now_ms - wd_boot_ms) < WD_BOOT_GRACE_MS;
-}
-
-static inline bool wd_reset_rate_limited(uint32_t now_ms)
-{
-    return (now_ms - wd_last_reset_attempt_ms) < WD_RESET_MIN_INTERVAL_MS;
-}
-
-static void wd_request_reset(const char *reason)
-{
-    uint32_t now = esp_log_timestamp();
-
-    if (wd_in_boot_grace(now)) {
-        ESP_LOGW(TAG, "WATCHDOG: would reset (%s) but still in boot grace", reason);
-        return;
-    }
-    if (wd_reset_rate_limited(now)) {
-        ESP_LOGW(TAG, "WATCHDOG: would reset (%s) but rate-limited", reason);
-        return;
-    }
-
-    wd_last_reset_attempt_ms = now;
-    ESP_LOGE(TAG, "WATCHDOG RESET: %s", reason);
-    fflush(stdout);
-    esp_restart();
-}
-
-/* ============================================================
- * MAC formatting helper (avoids MACSTR/MAC2STR format warnings)
- * ============================================================ */
-
-static inline void mac_to_str(const uint8_t mac[6], char out[18])
-{
-    snprintf(out, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
-/* ============================================================
- * SYSTEM INFO (runs in normal task, NOT timer task)
- * ============================================================ */
-
-static TaskHandle_t sysinfo_task_h = NULL;
-
-static void sysinfo_task(void *arg)
-{
-    (void)arg;
-
-    uint8_t primary = 0;
-    uint8_t sta_mac[6] = {0};
-    wifi_ap_record_t ap_info = {0};
-    wifi_second_chan_t second = 0;
-    wifi_sta_list_t wifi_sta_list = {0};
-
-    char self_mac_s[18];
-    char parent_mac_s[18];
-
-    for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        uint32_t now = esp_log_timestamp();
-
-        if (esp_mesh_lite_get_level() > 1) {
-            (void)esp_wifi_sta_get_ap_info(&ap_info);
-        } else {
-            memset(&ap_info, 0, sizeof(ap_info));
-        }
-
-        (void)esp_wifi_get_mac(ESP_IF_WIFI_STA, sta_mac);
-        (void)esp_wifi_ap_get_sta_list(&wifi_sta_list);
-        (void)esp_wifi_get_channel(&primary, &second);
-
-        mac_to_str(sta_mac, self_mac_s);
-        mac_to_str(ap_info.bssid, parent_mac_s);
-
-        ESP_LOGI(TAG,
-                 "System info, ch=%u layer=%d self=%s parent=%s parent_rssi=%d free_heap=%" PRIu32,
-                 (unsigned)primary,
-                 esp_mesh_lite_get_level(),
-                 self_mac_s,
-                 parent_mac_s,
-                 (ap_info.rssi != 0 ? ap_info.rssi : -120),
-                 (uint32_t)esp_get_free_heap_size());
-
-        for (int i = 0; i < wifi_sta_list.num; i++) {
-            char child_s[18];
-            mac_to_str(wifi_sta_list.sta[i].mac, child_s);
-            ESP_LOGI(TAG, "Child mac: %s", child_s);
-        }
-
-#if CONFIG_MESH_ROOT
-        if (wifi_sta_list.num > 0) {
-            wd_last_child_ok_ms = now;
-        }
-
-        if (!wd_in_boot_grace(now)) {
-            if ((now - wd_root_task_hb_ms) > WD_TASK_HEARTBEAT_TIMEOUT_MS) {
-                wd_request_reset("ROOT task heartbeat timeout");
-            }
-            if ((now - wd_last_child_ok_ms) > WD_ROOT_NO_CHILD_MS) {
-                wd_request_reset("ROOT no children timeout");
-            }
-        }
-#else
-        bool has_parent = false;
-        for (int i = 0; i < 6; i++) {
-            if (ap_info.bssid[i] != 0) { has_parent = true; break; }
-        }
-        if (has_parent) {
-            wd_last_parent_ok_ms = now;
-        }
-
-        if (!wd_in_boot_grace(now)) {
-            if ((now - wd_leaf_task_hb_ms) > WD_TASK_HEARTBEAT_TIMEOUT_MS) {
-                wd_request_reset("NODE task heartbeat timeout");
-            }
-            if ((now - wd_last_parent_ok_ms) > WD_LEAF_NO_PARENT_MS) {
-                wd_request_reset("NODE no parent timeout");
-            }
-
-            if (wd_udp_fail_window_start_ms == 0) {
-                wd_udp_fail_window_start_ms = now;
-                wd_udp_fail_count_in_window = 0;
-            } else if ((now - wd_udp_fail_window_start_ms) > WD_UDP_FAIL_WINDOW_MS) {
-                wd_udp_fail_window_start_ms = now;
-                wd_udp_fail_count_in_window = 0;
-            }
-
-            if (wd_udp_fail_count_in_window >= WD_UDP_FAIL_THRESHOLD) {
-                wd_request_reset("NODE excessive UDP send failures");
-            }
-        }
+#if !CONFIG_MESH_ROOT
+static int g_sock = -1;
+static struct sockaddr_in g_target;
 #endif
 
-        if (!wd_in_boot_grace(now)) {
-            if (esp_get_free_heap_size() < WD_HEAP_FLOOR_BYTES) {
-                wd_request_reset("Heap below floor");
-            }
-        }
-    }
-}
+/* ============================ HELPERS ============================ */
 
-static void sysinfo_timer_cb(TimerHandle_t t)
+static inline bool is_allowed_ascii(uint8_t c)
 {
-    (void)t;
-    if (sysinfo_task_h) {
-        xTaskNotifyGive(sysinfo_task_h);
-    }
+    return (c >= 32 && c <= 126);
 }
 
-/* ============================================================
- * NVS
- * ============================================================ */
-
-static esp_err_t esp_storage_init(void)
+static esp_err_t storage_init(void)
 {
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     return ret;
 }
-
-/* ============================================================
- * WIFI / BRIDGE
- * ============================================================ */
-
-static void wifi_init(void)
-{
-#if !CONFIG_MESH_ROOT
-    /* Leaf STA cfg blank (no router) */
-    wifi_config_t sta_cfg = {0};
-    esp_bridge_wifi_set_config(WIFI_IF_STA, &sta_cfg);
-#endif
-
-    wifi_config_t ap_cfg = {
-        .ap = {
-            .ssid = CONFIG_BRIDGE_SOFTAP_SSID,
-            .password = CONFIG_BRIDGE_SOFTAP_PASSWORD,
-            .channel = CONFIG_MESH_CHANNEL,
-            .pmf_cfg = { .capable = false, .required = false },
-        },
-    };
-
-    esp_bridge_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-}
-
-static void app_wifi_set_softap_info(void)
-{
-    char ssid[33] = {0};
-    char psk[64] = {0};
-    uint8_t mac[6];
-    size_t ssid_len = sizeof(ssid);
-    size_t psk_len = sizeof(psk);
-
-    esp_wifi_get_mac(WIFI_IF_AP, mac);
-
-    if (esp_mesh_lite_get_softap_ssid_from_nvs(ssid, &ssid_len) != ESP_OK) {
-#ifdef CONFIG_BRIDGE_SOFTAP_SSID_END_WITH_THE_MAC
-        snprintf(ssid, sizeof(ssid), "%.25s_%02x%02x%02x",
-                 CONFIG_BRIDGE_SOFTAP_SSID, mac[3], mac[4], mac[5]);
-#else
-        strlcpy(ssid, CONFIG_BRIDGE_SOFTAP_SSID, sizeof(ssid));
-#endif
-    }
-
-    if (esp_mesh_lite_get_softap_psw_from_nvs(psk, &psk_len) != ESP_OK) {
-        strlcpy(psk, CONFIG_BRIDGE_SOFTAP_PASSWORD, sizeof(psk));
-    }
-
-    ESP_LOGI(TAG, "SoftAP SSID: %s", ssid);
-    ESP_LOGI(TAG, "SoftAP PSK: [HIDDEN]");
-    ESP_ERROR_CHECK(esp_mesh_lite_set_softap_info(ssid, psk));
-}
-
-/* ============================================================
- * UART
- * ============================================================ */
 
 static void uart_init_bridge(void)
 {
@@ -325,7 +127,7 @@ static void uart_init_bridge(void)
         .source_clk = UART_SCLK_DEFAULT,
     };
 
-    ESP_ERROR_CHECK(uart_driver_install(U, 4096, 4096, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_driver_install(U, CONFIG_UART_RX_BUF, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(U, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(U,
                                 CONFIG_UART_TX_GPIO,
@@ -333,238 +135,223 @@ static void uart_init_bridge(void)
                                 UART_PIN_NO_CHANGE,
                                 UART_PIN_NO_CHANGE));
 
-    ESP_LOGI(TAG, "UART ready @ %d baud (UART1 TX=%d RX=%d)",
-             CONFIG_UART_BAUD, CONFIG_UART_TX_GPIO, CONFIG_UART_RX_GPIO);
+    ESP_LOGI(TAG, "UART ready @ %d baud (UART1 TX=%d RX=%d, RXbuf=%d)",
+             CONFIG_UART_BAUD, CONFIG_UART_TX_GPIO, CONFIG_UART_RX_GPIO, CONFIG_UART_RX_BUF);
 }
 
-/* ============================================================
- * Mesh-Lite "no_router" policy
- * ============================================================ */
-
-static void mesh_no_router_policy_apply(void)
+static void wifi_init_bridge(void)
 {
-    esp_err_t err;
+    /* SoftAP config always present (mesh uses it) */
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .ssid = CONFIG_BRIDGE_SOFTAP_SSID,
+            .password = CONFIG_BRIDGE_SOFTAP_PASSWORD,
+            .channel = CONFIG_MESH_CHANNEL,
+            .pmf_cfg = { .capable = false, .required = false },
+        },
+    };
+    esp_bridge_wifi_set_config(WIFI_IF_AP, &ap_cfg);
 
-    err = esp_mesh_lite_set_networking_mode(ESP_MESH_LITE_MESH, 0);
-    ESP_LOGI(TAG, "set_networking_mode(MESH) -> %s", esp_err_to_name(err));
-
-    mesh_lite_sta_config_t rcfg;
-    memset(&rcfg, 0, sizeof(rcfg));
-    err = esp_mesh_lite_set_router_config(&rcfg);
-    /* Some builds return ESP_FAIL on ROOT; don't die on it */
-    ESP_LOGI(TAG, "set_router_config(empty) -> %s", esp_err_to_name(err));
-
-    esp_mesh_lite_networking_mode_t mode = ESP_MESH_LITE_ROUTER;
-    err = esp_mesh_lite_get_networking_mode(&mode);
-    ESP_LOGI(TAG, "get_networking_mode -> %s, mode=%s",
-             esp_err_to_name(err),
-             (mode == ESP_MESH_LITE_MESH) ? "MESH" : "ROUTER");
-
-    /*
-     * IMPROVEMENT B:
-     * Frequent reconnect attempts; cap backoff to single digits
-     */
-    esp_mesh_lite_set_wifi_reconnect_interval(1, 8, 2);
+#if !CONFIG_MESH_ROOT
+    /* No-router STA cfg blank */
+    wifi_config_t sta_cfg = {0};
+    esp_bridge_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+#endif
 }
 
-/* ============================================================
- * PACKET SIZE / LINE LIMIT
- * ============================================================ */
+/* ============================ NODE TARGETING: STA GATEWAY ============================ */
 
-#ifndef CONFIG_MAX_LINE_LEN
-#define CONFIG_MAX_LINE_LEN 128
-#endif
+#if !CONFIG_MESH_ROOT
 
-/* ============================================================
- * FAST RECONNECT (NODE) via event + task
- * ============================================================ */
+static bool get_sta_gateway(uint32_t *gw_addr_net_order)
+{
+    if (!gw_addr_net_order) return false;
+
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta) return false;
+
+    esp_netif_ip_info_t ip;
+    if (esp_netif_get_ip_info(sta, &ip) != ESP_OK) return false;
+
+    if (ip.gw.addr == 0) return false;
+
+    *gw_addr_net_order = ip.gw.addr; /* already network order */
+    return true;
+}
+
+static void close_sock(void)
+{
+    if (g_sock >= 0) {
+        close(g_sock);
+        g_sock = -1;
+    }
+}
+
+static void rebuild_udp_target(void)
+{
+    uint32_t gw_net = 0;
+
+    /* Must have IP first */
+    if ((xEventGroupGetBits(g_evt) & EVT_STA_HAS_IP) == 0) {
+        return;
+    }
+
+    if (!get_sta_gateway(&gw_net)) {
+        return;
+    }
+
+    close_sock();
+
+    g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (g_sock < 0) {
+        ESP_LOGE(TAG, "NODE: socket() failed (errno=%d)", errno);
+        return;
+    }
+
+    /* Try increase send buffer */
+    int snd = CONFIG_UDP_SNDBUF;
+    (void)setsockopt(g_sock, SOL_SOCKET, SO_SNDBUF, &snd, sizeof(snd));
+
+    memset(&g_target, 0, sizeof(g_target));
+    g_target.sin_family = AF_INET;
+    g_target.sin_port   = htons(CONFIG_UDP_PORT);
+    g_target.sin_addr.s_addr = gw_net;
+
+    char ipstr[16];
+    inet_ntoa_r(g_target.sin_addr, ipstr, sizeof(ipstr));
+    ESP_LOGI(TAG, "NODE UDP target (GW->ROOT): %s:%d", ipstr, CONFIG_UDP_PORT);
+}
+
+#endif /* !CONFIG_MESH_ROOT */
+
+/* ============================ NODE QUICK RECONNECT ============================ */
 
 #if !CONFIG_MESH_ROOT
 
 static TaskHandle_t fast_reconnect_task_h = NULL;
 
-/*
- * IMPROVEMENT A:
- * Throttle the fast reconnect sequence to avoid thrashing when
- * multiple DISCONNECTED events arrive close together.
- */
-#define FAST_RECONNECT_COOLDOWN_MS 1500
+#define FAST_RECONNECT_COALESCE_MS    150
+#define FAST_RECONNECT_COOLDOWN_MS   1500
 
 static void fast_reconnect_task(void *arg)
 {
     (void)arg;
-    static uint32_t last_run_ms = 0;
+    uint32_t last_run = 0;
 
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        /* Coalesce tiny bursts of disconnect events */
-        vTaskDelay(pdMS_TO_TICKS(150));
+        vTaskDelay(pdMS_TO_TICKS(FAST_RECONNECT_COALESCE_MS));
 
-        uint32_t now = esp_log_timestamp();
-        if (now - last_run_ms < FAST_RECONNECT_COOLDOWN_MS) {
-            continue;
-        }
-        last_run_ms = now;
+        uint32_t now = (uint32_t)esp_log_timestamp();
+        if (now - last_run < FAST_RECONNECT_COOLDOWN_MS) continue;
+        last_run = now;
 
-        /* In your Mesh-Lite this returns void */
+        /* Clear old parent hint */
         esp_mesh_lite_erase_rtc_store();
         ESP_LOGW(TAG, "FAST-RECONNECT: erase_rtc_store done");
 
-        /* Force a quick scan to find alternate parent sooner */
+        /* Quick scan to find alternate parent */
         esp_err_t e2 = esp_mesh_lite_wifi_scan_start(NULL, 2500);
         ESP_LOGW(TAG, "FAST-RECONNECT: wifi_scan_start(2500ms) -> %s", esp_err_to_name(e2));
 
-        /* Kick WiFi reconnect now */
+        /* Kick reconnect */
         (void)esp_wifi_disconnect();
         esp_err_t e3 = esp_wifi_connect();
         ESP_LOGW(TAG, "FAST-RECONNECT: esp_wifi_connect -> %s", esp_err_to_name(e3));
     }
 }
 
+#endif /* !CONFIG_MESH_ROOT */
+
+/* ============================ EVENTS ============================ */
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)data;
 
+#if !CONFIG_MESH_ROOT
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (fast_reconnect_task_h) {
-            xTaskNotifyGive(fast_reconnect_task_h);
-        }
-    }
+        /* Not ready until we regain IP */
+        xEventGroupClearBits(g_evt, EVT_STA_HAS_IP);
+        xEventGroupSetBits(g_evt, EVT_REBUILD_TARGET);
 
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
-        wd_last_parent_ok_ms = esp_log_timestamp();
+        if (fast_reconnect_task_h) xTaskNotifyGive(fast_reconnect_task_h);
     }
+#endif
 }
 
-#endif /* !CONFIG_MESH_ROOT */
-
-/* ============================================================
- * NODE (non-root): UART -> UDP (to ROOT)
- * ============================================================ */
+static void ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg;
 
 #if !CONFIG_MESH_ROOT
+    if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "STA GOT IP: " IPSTR " GW: " IPSTR,
+                 IP2STR(&e->ip_info.ip), IP2STR(&e->ip_info.gw));
 
-static int node_udp_sock = -1;
-static struct sockaddr_in root_addr;
-
-static inline bool is_allowed_ascii(uint8_t c)
-{
-    return (c >= 32 && c <= 126);
+        xEventGroupSetBits(g_evt, EVT_STA_HAS_IP | EVT_REBUILD_TARGET);
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
+        ESP_LOGW(TAG, "STA LOST IP");
+        xEventGroupClearBits(g_evt, EVT_STA_HAS_IP);
+        xEventGroupSetBits(g_evt, EVT_REBUILD_TARGET);
+    }
+#endif
 }
 
-/* Decide if IP string is a sane mesh LAN IPv4 (default expects 192.168.*.*) */
-static bool looks_like_mesh_lan_ipv4(const char *ipstr)
-{
-    if (!ipstr) return false;
-    return (strncmp(ipstr, "192.168.", 8) == 0);
-}
+/* ============================ NODE: UART -> UDP (BATCHED) ============================ */
 
-/*
- * FIX: Root IP endianness ambiguity.
- * We test two candidates:
- *  - A: ip.u_addr.ip4.addr as returned
- *  - B: htonl(A) (byte-swapped)
- * and choose the one that matches expected mesh LAN prefix.
- */
-static bool get_root_ip_u32(uint32_t *out_addr_net_order)
-{
-    if (!out_addr_net_order) return false;
-
-    esp_ip_addr_t ip;
-    memset(&ip, 0, sizeof(ip));
-
-    esp_err_t err = esp_mesh_lite_get_root_ip(IPADDR_TYPE_V4, &ip);
-    if (err != ESP_OK) return false;
-    if (ip.type != IPADDR_TYPE_V4) return false;
-
-    uint32_t a = ip.u_addr.ip4.addr;
-    if (a == 0) return false;
-
-    struct in_addr ia1 = { .s_addr = a };
-    char s1[16] = {0};
-    inet_ntoa_r(ia1, s1, sizeof(s1));
-
-    uint32_t b = htonl(a);
-    struct in_addr ia2 = { .s_addr = b };
-    char s2[16] = {0};
-    inet_ntoa_r(ia2, s2, sizeof(s2));
-
-    bool s1_ok = looks_like_mesh_lan_ipv4(s1);
-    bool s2_ok = looks_like_mesh_lan_ipv4(s2);
-
-    uint32_t chosen = 0;
-
-    if (s1_ok && !s2_ok) chosen = a;
-    else if (!s1_ok && s2_ok) chosen = b;
-    else {
-        /* Fallback:
-         * Your observed broken case is s1="1.5.168.192" and s2="192.168.5.1",
-         * so prefer swapped if ambiguous.
-         */
-        chosen = b;
-    }
-
-    *out_addr_net_order = chosen;
-    return true;
-}
-
-static void node_udp_init_when_ready(void)
-{
-    uint32_t root_ip_net = 0;
-    if (!get_root_ip_u32(&root_ip_net)) {
-        ESP_LOGW(TAG, "NODE: root IP not known yet; waiting…");
-        return;
-    }
-
-    int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (s < 0) {
-        ESP_LOGE(TAG, "NODE: socket() failed");
-        return;
-    }
-
-    memset(&root_addr, 0, sizeof(root_addr));
-    root_addr.sin_family = AF_INET;
-    root_addr.sin_port   = htons(CONFIG_UDP_PORT);
-    root_addr.sin_addr.s_addr = root_ip_net;
-
-    node_udp_sock = s;
-
-    char ipstr[16];
-    (void)inet_ntoa_r(root_addr.sin_addr, ipstr, sizeof(ipstr));
-    ESP_LOGI(TAG, "NODE UDP target (ROOT): %s:%d", ipstr, CONFIG_UDP_PORT);
-}
-
-static void node_udp_reset_and_reresolve(void)
-{
-    if (node_udp_sock >= 0) {
-        close(node_udp_sock);
-        node_udp_sock = -1;
-    }
-
-    while (node_udp_sock < 0) {
-        node_udp_init_when_ready();
-        if (node_udp_sock >= 0) break;
-        vTaskDelay(pdMS_TO_TICKS(250));
-    }
-}
+#if !CONFIG_MESH_ROOT
 
 static void node_uart_to_udp_task(void *arg)
 {
     (void)arg;
-    const uart_port_t U = UART_NUM_1;
-
-    node_udp_reset_and_reresolve();
-
-    static uint8_t line[CONFIG_MAX_LINE_LEN + 2];
-    size_t len = 0;
 
     uint8_t rx[256];
 
-    for (;;) {
-        wd_leaf_task_hb_ms = esp_log_timestamp();
+    /* line assembly */
+    uint8_t line[CONFIG_MAX_LINE_LEN + 1];
+    int line_len = 0;
 
-        int n = uart_read_bytes(U, rx, sizeof(rx), pdMS_TO_TICKS(100));
+    /* UDP batch buffer */
+    uint8_t batch[CONFIG_UDP_BATCH_MAX];
+    int batch_len = 0;
+    uint32_t last_flush_ms = (uint32_t)esp_log_timestamp();
+
+    for (;;) {
+        /* Wait until we have IP at least once */
+        xEventGroupWaitBits(g_evt, EVT_STA_HAS_IP, pdFALSE, pdTRUE, portMAX_DELAY);
+
+        /* Rebuild target if requested */
+        EventBits_t b = xEventGroupGetBits(g_evt);
+        if (b & EVT_REBUILD_TARGET) {
+            xEventGroupClearBits(g_evt, EVT_REBUILD_TARGET);
+            rebuild_udp_target();
+        }
+
+        /* If socket not ready yet, keep trying */
+        if (g_sock < 0) {
+            rebuild_udp_target();
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        int n = uart_read_bytes(UART_NUM_1, rx, sizeof(rx), pdMS_TO_TICKS(20));
+        uint32_t now = (uint32_t)esp_log_timestamp();
+
+        /* Flush if idle for a moment and batch has data */
+        if (batch_len > 0 && (now - last_flush_ms) >= CONFIG_UDP_BATCH_FLUSH_MS) {
+            int sent = sendto(g_sock, batch, batch_len, 0,
+                              (struct sockaddr *)&g_target, sizeof(g_target));
+            if (sent < 0) {
+                ESP_LOGW(TAG, "NODE: batch send failed (errno=%d) -> rebuild target", errno);
+                xEventGroupSetBits(g_evt, EVT_REBUILD_TARGET);
+            }
+            batch_len = 0;
+            last_flush_ms = now;
+        }
+
         if (n <= 0) continue;
 
         for (int i = 0; i < n; i++) {
@@ -573,54 +360,62 @@ static void node_uart_to_udp_task(void *arg)
             if (c == '\r') continue;
 
             if (c == '\n') {
-                if (len == 0) continue;
+                if (line_len == 0) continue;
 
-                line[len++] = '\n';
+                /* append newline */
+                line[line_len++] = '\n';
 
-                int sent = sendto(node_udp_sock, line, len, 0,
-                                  (struct sockaddr *)&root_addr, sizeof(root_addr));
-                if (sent < 0) {
-                    ESP_LOGW(TAG, "NODE: sendto failed; resetting UDP target (errno=%d)", errno);
-
-                    uint32_t now = esp_log_timestamp();
-                    if (wd_udp_fail_window_start_ms == 0) {
-                        wd_udp_fail_window_start_ms = now;
-                        wd_udp_fail_count_in_window = 0;
-                    }
-                    if ((now - wd_udp_fail_window_start_ms) > WD_UDP_FAIL_WINDOW_MS) {
-                        wd_udp_fail_window_start_ms = now;
-                        wd_udp_fail_count_in_window = 0;
-                    }
-                    wd_udp_fail_count_in_window++;
-
-                    node_udp_reset_and_reresolve();
-                    (void)sendto(node_udp_sock, line, len, 0,
-                                 (struct sockaddr *)&root_addr, sizeof(root_addr));
-                } else {
-                    uint32_t now = esp_log_timestamp();
-                    if (wd_udp_fail_window_start_ms == 0) {
-                        wd_udp_fail_window_start_ms = now;
-                        wd_udp_fail_count_in_window = 0;
-                    }
-                    if ((now - wd_udp_fail_window_start_ms) > WD_UDP_FAIL_WINDOW_MS) {
-                        wd_udp_fail_window_start_ms = now;
-                        wd_udp_fail_count_in_window = 0;
-                    }
+                /* If line won't fit in batch, flush batch first */
+                if (line_len > CONFIG_UDP_BATCH_MAX) {
+                    /* absurdly large (should never happen due to MAX_LINE), drop */
+                    line_len = 0;
+                    continue;
                 }
 
-                len = 0;
+                if (batch_len + line_len > CONFIG_UDP_BATCH_MAX) {
+                    int sent = sendto(g_sock, batch, batch_len, 0,
+                                      (struct sockaddr *)&g_target, sizeof(g_target));
+                    if (sent < 0) {
+                        ESP_LOGW(TAG, "NODE: batch send failed (errno=%d) -> rebuild target", errno);
+                        xEventGroupSetBits(g_evt, EVT_REBUILD_TARGET);
+                        batch_len = 0;
+                        line_len = 0;
+                        break;
+                    }
+                    batch_len = 0;
+                    last_flush_ms = (uint32_t)esp_log_timestamp();
+                }
+
+                memcpy(&batch[batch_len], line, line_len);
+                batch_len += line_len;
+                line_len = 0;
+
+                /* If batch is “big enough”, flush immediately */
+                if (batch_len >= (CONFIG_UDP_BATCH_MAX - (CONFIG_MAX_LINE_LEN + 2))) {
+                    int sent = sendto(g_sock, batch, batch_len, 0,
+                                      (struct sockaddr *)&g_target, sizeof(g_target));
+                    if (sent < 0) {
+                        ESP_LOGW(TAG, "NODE: batch send failed (errno=%d) -> rebuild target", errno);
+                        xEventGroupSetBits(g_evt, EVT_REBUILD_TARGET);
+                    }
+                    batch_len = 0;
+                    last_flush_ms = (uint32_t)esp_log_timestamp();
+                }
+
                 continue;
             }
 
+            /* ASCII-only rule */
             if (!is_allowed_ascii(c)) {
-                len = 0;
+                line_len = 0;
                 continue;
             }
 
-            if (len < (size_t)CONFIG_MAX_LINE_LEN) {
-                line[len++] = c;
+            if (line_len < CONFIG_MAX_LINE_LEN) {
+                line[line_len++] = c;
             } else {
-                len = 0;
+                /* oversize -> drop */
+                line_len = 0;
             }
         }
     }
@@ -628,109 +423,75 @@ static void node_uart_to_udp_task(void *arg)
 
 #endif /* !CONFIG_MESH_ROOT */
 
-/* ============================================================
- * ROOT: UDP -> UART
- * ============================================================ */
+/* ============================ ROOT: UDP -> UART ============================ */
 
 #if CONFIG_MESH_ROOT
 
 static void root_udp_to_uart_task(void *arg)
 {
     (void)arg;
-    const uart_port_t U = UART_NUM_1;
 
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0) {
-        ESP_LOGE(TAG, "Root: socket() failed");
+    int rsock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (rsock < 0) {
+        ESP_LOGE(TAG, "ROOT: socket() failed (errno=%d)", errno);
         vTaskDelete(NULL);
         return;
     }
 
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(CONFIG_UDP_PORT),
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-    };
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(CONFIG_UDP_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        ESP_LOGE(TAG, "Root: bind() failed on port %d", CONFIG_UDP_PORT);
-        close(sock);
+    if (bind(rsock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        ESP_LOGE(TAG, "ROOT: bind() failed (errno=%d)", errno);
+        close(rsock);
         vTaskDelete(NULL);
         return;
     }
 
-    ESP_LOGI(TAG, "Root UDP listening on %d", CONFIG_UDP_PORT);
+    ESP_LOGI(TAG, "ROOT UDP listening on %d", CONFIG_UDP_PORT);
 
-    uint8_t buf[CONFIG_MAX_LINE_LEN + 2];
+    uint8_t buf[CONFIG_UDP_BATCH_MAX];
 
     for (;;) {
-        wd_root_task_hb_ms = esp_log_timestamp();
-
-        int n = recvfrom(sock, buf, sizeof(buf), 0, NULL, NULL);
+        int n = recvfrom(rsock, buf, sizeof(buf), 0, NULL, NULL);
         if (n > 0) {
-            uart_write_bytes(U, (const char *)buf, n);
+            uart_write_bytes(UART_NUM_1, (const char *)buf, n);
         }
     }
 }
 
 #endif /* CONFIG_MESH_ROOT */
 
-/* ============================================================
- * APP MAIN
- * ============================================================ */
+/* ============================ APP MAIN ============================ */
 
 void app_main(void)
 {
-    esp_log_level_set("*", ESP_LOG_INFO);
-
-    wd_boot_ms = esp_log_timestamp();
-    wd_last_reset_attempt_ms = 0;
-
-    wd_last_parent_ok_ms = wd_boot_ms;
-    wd_last_child_ok_ms  = wd_boot_ms;
-
-    wd_leaf_task_hb_ms = wd_boot_ms;
-    wd_root_task_hb_ms = wd_boot_ms;
-
-    wd_udp_fail_window_start_ms = 0;
-    wd_udp_fail_count_in_window = 0;
-
-    ESP_ERROR_CHECK(esp_storage_init());
+    ESP_ERROR_CHECK(storage_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    esp_bridge_create_all_netif();
-    wifi_init();
+    g_evt = xEventGroupCreate();
 
-    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20));
-    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
+    esp_bridge_create_all_netif();
+    wifi_init_bridge();
 
     esp_mesh_lite_config_t cfg = ESP_MESH_LITE_DEFAULT_INIT();
     cfg.join_mesh_ignore_router_status = true;
     cfg.join_mesh_without_configured_wifi = true;
 
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &ip_event_handler, NULL));
+
     esp_mesh_lite_init(&cfg);
 
-    /* No power-save */
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-
 #if CONFIG_MESH_ROOT
-    /* ROOT must be AP-only (prevents unwanted STA behavior) */
+    /* ROOT must be AP-only in no_router mode */
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-#endif
-
-    mesh_no_router_policy_apply();
-    app_wifi_set_softap_info();
-
-#if CONFIG_MESH_ROOT
-    ESP_LOGI(TAG, "Role: ROOT");
-    esp_mesh_lite_set_allowed_level(1);
 #else
-    ESP_LOGI(TAG, "Role: NODE");
-
-    /* FAST reconnect infra */
     xTaskCreate(fast_reconnect_task, "fast_reconnect", 4096, NULL, 12, &fast_reconnect_task_h);
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
 #endif
 
     esp_mesh_lite_start();
@@ -742,12 +503,4 @@ void app_main(void)
 #else
     xTaskCreate(node_uart_to_udp_task, "node_uart_to_udp", 4096, NULL, 10, NULL);
 #endif
-
-    xTaskCreate(sysinfo_task, "sysinfo", 4096, NULL, 5, &sysinfo_task_h);
-
-    TimerHandle_t t = xTimerCreate("sysinfo_timer",
-                                   pdMS_TO_TICKS(10000),
-                                   true, NULL,
-                                   sysinfo_timer_cb);
-    xTimerStart(t, 0);
 }
