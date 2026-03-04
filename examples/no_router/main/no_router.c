@@ -10,8 +10,8 @@
  * NO ROUTER / NO INTERNET
  *
  * FIXES + IMPROVEMENTS:
- *   FIX: Correct ROOT IP handling (no byte-swap). Your log showed 1.5.168.192.
- *        Now it will correctly show 192.168.5.1 and send packets to the real root.
+ *   FIX: Correct ROOT IP handling (no byte-swap / no lwIP ip_2_ip4 misuse).
+ *        Your log showed 1.5.168.192; this fixes it to 192.168.5.1 etc.
  *
  *   A) Throttle fast reconnect actions (cooldown) to avoid thrash on repeated disconnect events
  *   B) Faster reconnect backoff cap (max 8s) so it doesn't drift to 30s intervals
@@ -42,8 +42,7 @@
 
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
-#include "lwip/ip_addr.h"
-#include "lwip/ip4_addr.h"   // ip4_addr_t, ip4addr_ntoa_r
+#include "lwip/ip_addr.h"   // IPADDR_TYPE_V4
 
 #include "driver/uart.h"
 
@@ -401,9 +400,7 @@ static void fast_reconnect_task(void *arg)
         }
         last_run_ms = now;
 
-        /*
-         * In your Mesh-Lite version this returns void (not esp_err_t)
-         */
+        /* In your Mesh-Lite this returns void */
         esp_mesh_lite_erase_rtc_store();
         ESP_LOGW(TAG, "FAST-RECONNECT: erase_rtc_store done");
 
@@ -450,12 +447,14 @@ static inline bool is_allowed_ascii(uint8_t c)
 }
 
 /*
- * FIX: get root IPv4 address without byte-swapping.
- * We keep lwIP's ip4_addr_t.addr as-is (network order) and copy into sockaddr.
+ * FIX: Correctly read IPv4 from esp_ip_addr_t (ESP-IDF type),
+ * without lwIP ip_2_ip4() which expects lwIP ip_addr_t.
+ *
+ * esp_ip_addr_t.u_addr.ip4.addr is already in network byte order.
  */
-static bool get_root_ip_ipv4(ip4_addr_t *out_ip4)
+static bool get_root_ip_u32(uint32_t *out_addr_net_order)
 {
-    if (!out_ip4) return false;
+    if (!out_addr_net_order) return false;
 
     esp_ip_addr_t ip;
     memset(&ip, 0, sizeof(ip));
@@ -464,17 +463,17 @@ static bool get_root_ip_ipv4(ip4_addr_t *out_ip4)
     if (err != ESP_OK) return false;
     if (ip.type != IPADDR_TYPE_V4) return false;
 
-    const ip4_addr_t *ip4 = ip_2_ip4(&ip);
-    if (!ip4 || ip4->addr == 0) return false;
+    uint32_t a = ip.u_addr.ip4.addr;  /* network order */
+    if (a == 0) return false;
 
-    *out_ip4 = *ip4;
+    *out_addr_net_order = a;
     return true;
 }
 
 static void node_udp_init_when_ready(void)
 {
-    ip4_addr_t root_ip4;
-    if (!get_root_ip_ipv4(&root_ip4)) {
+    uint32_t root_ip_net = 0;
+    if (!get_root_ip_u32(&root_ip_net)) {
         ESP_LOGW(TAG, "NODE: root IP not known yet; waiting…");
         return;
     }
@@ -488,14 +487,12 @@ static void node_udp_init_when_ready(void)
     memset(&root_addr, 0, sizeof(root_addr));
     root_addr.sin_family = AF_INET;
     root_addr.sin_port   = htons(CONFIG_UDP_PORT);
-
-    /* sockaddr expects IPv4 in network order; root_ip4.addr is already that. */
-    root_addr.sin_addr.s_addr = root_ip4.addr;
+    root_addr.sin_addr.s_addr = root_ip_net;
 
     node_udp_sock = s;
 
     char ipstr[16];
-    ip4addr_ntoa_r(&root_ip4, ipstr, sizeof(ipstr));
+    (void)inet_ntoa_r(root_addr.sin_addr, ipstr, sizeof(ipstr));
     ESP_LOGI(TAG, "NODE UDP target (ROOT): %s:%d", ipstr, CONFIG_UDP_PORT);
 }
 
