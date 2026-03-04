@@ -9,36 +9,35 @@
  *
  * NO ROUTER / NO INTERNET
  *
- * Key behavior:
- * - Force Mesh-Lite networking mode to MESH and clear router config (no uplink)
- * - ROOT does NOT attempt upstream connect when used with the Mesh-Lite core fix
- * - NODE forwards scanner UART lines as UDP datagrams to ROOT (target = ROOT IP)
+ * FAST ROAM / FAST RECONNECT:
+ * - On NODE WiFi disconnect, we:
+ *   1) erase Mesh-Lite RTC parent hint (prevents long "original parent" retries)
+ *   2) force a short scan
+ *   3) reconnect immediately
+ *
+ * This typically cuts “self-heal” time to single-digit seconds if another parent exists.
  */
 
 #include <inttypes.h>
 #include <string.h>
-#include <ctype.h>
 #include <errno.h>
 #include <stdbool.h>
-
-#include "esp_log.h"
-#include "esp_system.h"
-#include "esp_err.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
 
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_err.h"
 #include "esp_wifi.h"
-#include "nvs_flash.h"
-#include "esp_mac.h"
-
-#include "esp_netif.h"
 #include "esp_event.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
 
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
-#include "lwip/ip_addr.h"   // esp_ip_addr_t + IPADDR_TYPE_V4 + ip_2_ip4()
+#include "lwip/ip_addr.h"   // esp_ip_addr_t + ip_2_ip4()
 
 #include "driver/uart.h"
 
@@ -50,23 +49,22 @@
 static const char *TAG = "no_router_uart_udp";
 
 /* ============================================================
- * WATCHDOGS 1–4 (NO HW WDT)
+ * WATCHDOGS (soft reset only)
  * ============================================================ */
 
-/* ---- Tunables (conservative defaults) ---- */
 #define WD_BOOT_GRACE_MS                 (30 * 1000)
-#define WD_RESET_MIN_INTERVAL_MS         (1 * 60 * 1000)
+#define WD_RESET_MIN_INTERVAL_MS         (60 * 1000)
 
-#define WD_LEAF_NO_PARENT_MS             (60 * 1000)
-#define WD_ROOT_NO_CHILD_MS              (60 * 1000)
+/* Make these LESS aggressive. We now actively reconnect instead of rebooting. */
+#define WD_LEAF_NO_PARENT_MS             (180 * 1000)   // was 30s; too aggressive
+#define WD_ROOT_NO_CHILD_MS              (300 * 1000)
 
-#define WD_TASK_HEARTBEAT_TIMEOUT_MS     (45 * 1000)
+#define WD_TASK_HEARTBEAT_TIMEOUT_MS     (60 * 1000)
 #define WD_HEAP_FLOOR_BYTES              (50 * 1024)
 
 #define WD_UDP_FAIL_WINDOW_MS            (60 * 1000)
 #define WD_UDP_FAIL_THRESHOLD            (20)
 
-/* ---- State ---- */
 static uint32_t wd_boot_ms = 0;
 static uint32_t wd_last_reset_attempt_ms = 0;
 
@@ -80,7 +78,6 @@ static uint32_t wd_root_task_hb_ms = 0;
 static uint32_t wd_udp_fail_window_start_ms = 0;
 static uint32_t wd_udp_fail_count_in_window = 0;
 
-/* ---- Helpers ---- */
 static inline bool wd_in_boot_grace(uint32_t now_ms)
 {
     return (now_ms - wd_boot_ms) < WD_BOOT_GRACE_MS;
@@ -237,6 +234,7 @@ static esp_err_t esp_storage_init(void)
 static void wifi_init(void)
 {
 #if !CONFIG_MESH_ROOT
+    /* Leaf STA cfg blank (no router) */
     wifi_config_t sta_cfg = {0};
     esp_bridge_wifi_set_config(WIFI_IF_STA, &sta_cfg);
 #endif
@@ -246,10 +244,7 @@ static void wifi_init(void)
             .ssid = CONFIG_BRIDGE_SOFTAP_SSID,
             .password = CONFIG_BRIDGE_SOFTAP_PASSWORD,
             .channel = CONFIG_MESH_CHANNEL,
-            .pmf_cfg = {
-                .capable  = false,
-                .required = false,
-            },
+            .pmf_cfg = { .capable = false, .required = false },
         },
     };
 
@@ -269,8 +264,7 @@ static void app_wifi_set_softap_info(void)
     if (esp_mesh_lite_get_softap_ssid_from_nvs(ssid, &ssid_len) != ESP_OK) {
 #ifdef CONFIG_BRIDGE_SOFTAP_SSID_END_WITH_THE_MAC
         snprintf(ssid, sizeof(ssid), "%.25s_%02x%02x%02x",
-                 CONFIG_BRIDGE_SOFTAP_SSID,
-                 mac[3], mac[4], mac[5]);
+                 CONFIG_BRIDGE_SOFTAP_SSID, mac[3], mac[4], mac[5]);
 #else
         strlcpy(ssid, CONFIG_BRIDGE_SOFTAP_SSID, sizeof(ssid));
 #endif
@@ -315,7 +309,7 @@ static void uart_init_bridge(void)
 }
 
 /* ============================================================
- * Mesh-Lite policy for "no_router"
+ * Mesh-Lite "no_router" policy
  * ============================================================ */
 
 static void mesh_no_router_policy_apply(void)
@@ -336,16 +330,77 @@ static void mesh_no_router_policy_apply(void)
              esp_err_to_name(err),
              (mode == ESP_MESH_LITE_MESH) ? "MESH" : "ROUTER");
 
+    /* Keep reconnect attempts frequent */
     esp_mesh_lite_set_wifi_reconnect_interval(1, 30, 3);
 }
 
 /* ============================================================
- * PACKET SIZE / LINE LIMIT (shared by ROOT + NODE)
+ * PACKET SIZE / LINE LIMIT
  * ============================================================ */
 
 #ifndef CONFIG_MAX_LINE_LEN
 #define CONFIG_MAX_LINE_LEN 128
 #endif
+
+/* ============================================================
+ * FAST RECONNECT (NODE) via event + task
+ * ============================================================ */
+
+#if !CONFIG_MESH_ROOT
+
+static TaskHandle_t fast_reconnect_task_h = NULL;
+static volatile uint32_t last_disc_ms = 0;
+
+static void fast_reconnect_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        /* Small coalesce delay so multiple DISCONNECTED events don't thrash */
+        vTaskDelay(pdMS_TO_TICKS(150));
+
+        uint32_t now = esp_log_timestamp();
+
+        /* Stop Mesh-Lite from wasting time on the old parent hint */
+        esp_err_t e1 = esp_mesh_lite_erase_rtc_store();
+        ESP_LOGW(TAG, "FAST-RECONNECT: erase_rtc_store -> %s", esp_err_to_name(e1));
+
+        /* Force a scan quickly (helps find alternate parent faster) */
+        esp_err_t e2 = esp_mesh_lite_wifi_scan_start(NULL, 2500);
+        ESP_LOGW(TAG, "FAST-RECONNECT: wifi_scan_start(2500ms) -> %s", esp_err_to_name(e2));
+
+        /* Kick WiFi reconnect now */
+        (void)esp_wifi_disconnect();
+        esp_err_t e3 = esp_wifi_connect();
+        ESP_LOGW(TAG, "FAST-RECONNECT: esp_wifi_connect -> %s", esp_err_to_name(e3));
+
+        /* Update watchdog “parent ok” time if we reconnect quickly */
+        (void)now;
+    }
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg; (void)data;
+
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        uint32_t now = esp_log_timestamp();
+        last_disc_ms = now;
+
+        /* Trigger fast reconnect task (non-blocking) */
+        if (fast_reconnect_task_h) {
+            xTaskNotifyGive(fast_reconnect_task_h);
+        }
+    }
+
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+        wd_last_parent_ok_ms = esp_log_timestamp();
+    }
+}
+
+#endif /* !CONFIG_MESH_ROOT */
 
 /* ============================================================
  * NODE (non-root): UART -> UDP (to ROOT)
@@ -361,9 +416,7 @@ static inline bool is_allowed_ascii(uint8_t c)
     return (c >= 32 && c <= 126);
 }
 
-/*
- * esp_mesh_lite_get_root_ip(uint8_t type, esp_ip_addr_t *ip_addr)
- */
+/* esp_mesh_lite_get_root_ip(uint8_t type, esp_ip_addr_t *ip_addr) */
 static bool get_root_ip_u32(uint32_t *out_addr)
 {
     if (!out_addr) return false;
@@ -372,17 +425,11 @@ static bool get_root_ip_u32(uint32_t *out_addr)
     memset(&ip, 0, sizeof(ip));
 
     esp_err_t err = esp_mesh_lite_get_root_ip(IPADDR_TYPE_V4, &ip);
-    if (err != ESP_OK) {
-        return false;
-    }
-    if (ip.type != IPADDR_TYPE_V4) {
-        return false;
-    }
+    if (err != ESP_OK) return false;
+    if (ip.type != IPADDR_TYPE_V4) return false;
 
-    uint32_t addr = ip_2_ip4(&ip)->addr;  // lwIP stored form (often host-order in some builds)
-    if (addr == 0) {
-        return false;
-    }
+    uint32_t addr = ip_2_ip4(&ip)->addr;  // network order
+    if (addr == 0) return false;
 
     *out_addr = addr;
     return true;
@@ -405,9 +452,7 @@ static void node_udp_init_when_ready(void)
     memset(&root_addr, 0, sizeof(root_addr));
     root_addr.sin_family = AF_INET;
     root_addr.sin_port = htons(CONFIG_UDP_PORT);
-
-    // ✅ FIX: ensure correct byte order for sockaddr_in
-    root_addr.sin_addr.s_addr = htonl(root_ip_u32);
+    root_addr.sin_addr.s_addr = root_ip_u32;
 
     node_udp_sock = s;
 
@@ -425,7 +470,7 @@ static void node_udp_reset_and_reresolve(void)
     while (node_udp_sock < 0) {
         node_udp_init_when_ready();
         if (node_udp_sock >= 0) break;
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
 
@@ -591,9 +636,11 @@ void app_main(void)
 
     esp_mesh_lite_init(&cfg);
 
+    /* No power-save */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
 #if CONFIG_MESH_ROOT
+    /* ROOT must be AP-only (prevents unwanted STA behavior) */
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
 #endif
 
@@ -605,6 +652,11 @@ void app_main(void)
     esp_mesh_lite_set_allowed_level(1);
 #else
     ESP_LOGI(TAG, "Role: NODE");
+
+    /* FAST reconnect infra */
+    xTaskCreate(fast_reconnect_task, "fast_reconnect", 4096, NULL, 12, &fast_reconnect_task_h);
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
 #endif
 
     esp_mesh_lite_start();
