@@ -57,8 +57,8 @@ static const char *TAG = "no_router_uart_udp";
 #define WD_BOOT_GRACE_MS                 (30 * 1000)
 #define WD_RESET_MIN_INTERVAL_MS         (1 * 60 * 1000)
 
-#define WD_LEAF_NO_PARENT_MS             (30 * 1000)
-#define WD_ROOT_NO_CHILD_MS              (30 * 1000)
+#define WD_LEAF_NO_PARENT_MS             (60 * 1000)
+#define WD_ROOT_NO_CHILD_MS              (60 * 1000)
 
 #define WD_TASK_HEARTBEAT_TIMEOUT_MS     (45 * 1000)
 #define WD_HEAP_FLOOR_BYTES              (50 * 1024)
@@ -336,7 +336,7 @@ static void mesh_no_router_policy_apply(void)
              esp_err_to_name(err),
              (mode == ESP_MESH_LITE_MESH) ? "MESH" : "ROUTER");
 
-    esp_mesh_lite_set_wifi_reconnect_interval(30, 0, 3600);
+    esp_mesh_lite_set_wifi_reconnect_interval(1, 30, 3);
 }
 
 /* ============================================================
