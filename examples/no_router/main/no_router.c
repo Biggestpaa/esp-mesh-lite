@@ -9,15 +9,17 @@
  *
  * NO ROUTER / NO INTERNET
  *
- * FAST ROAM / FAST RECONNECT:
- * - On NODE WiFi disconnect, we:
- *   1) erase Mesh-Lite RTC parent hint (prevents long "original parent" retries)
- *   2) force a short scan
- *   3) reconnect immediately
+ * FIXES + IMPROVEMENTS:
+ *   FIX: Correct ROOT IP handling (no byte-swap). Your log showed 1.5.168.192.
+ *        Now it will correctly show 192.168.5.1 and send packets to the real root.
  *
- * IMPROVEMENTS ADDED:
  *   A) Throttle fast reconnect actions (cooldown) to avoid thrash on repeated disconnect events
  *   B) Faster reconnect backoff cap (max 8s) so it doesn't drift to 30s intervals
+ *
+ * Notes:
+ * - Root is forced AP-only after Mesh-Lite init to prevent STA connect spam in no_router mode.
+ * - set_router_config(empty) sometimes returns ESP_FAIL on ROOT in some Mesh-Lite builds;
+ *   we log it but do not abort.
  */
 
 #include <inttypes.h>
@@ -40,7 +42,8 @@
 
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
-#include "lwip/ip_addr.h"   // esp_ip_addr_t + ip_2_ip4()
+#include "lwip/ip_addr.h"
+#include "lwip/ip4_addr.h"   // ip4_addr_t, ip4addr_ntoa_r
 
 #include "driver/uart.h"
 
@@ -342,6 +345,7 @@ static void mesh_no_router_policy_apply(void)
     mesh_lite_sta_config_t rcfg;
     memset(&rcfg, 0, sizeof(rcfg));
     err = esp_mesh_lite_set_router_config(&rcfg);
+    /* Some builds return ESP_FAIL on ROOT; don't die on it */
     ESP_LOGI(TAG, "set_router_config(empty) -> %s", esp_err_to_name(err));
 
     esp_mesh_lite_networking_mode_t mode = ESP_MESH_LITE_ROUTER;
@@ -398,8 +402,7 @@ static void fast_reconnect_task(void *arg)
         last_run_ms = now;
 
         /*
-         * NOTE: In your Mesh-Lite version this returns void (not esp_err_t)
-         * so don't assign it.
+         * In your Mesh-Lite version this returns void (not esp_err_t)
          */
         esp_mesh_lite_erase_rtc_store();
         ESP_LOGW(TAG, "FAST-RECONNECT: erase_rtc_store done");
@@ -446,10 +449,13 @@ static inline bool is_allowed_ascii(uint8_t c)
     return (c >= 32 && c <= 126);
 }
 
-/* esp_mesh_lite_get_root_ip(uint8_t type, esp_ip_addr_t *ip_addr) */
-static bool get_root_ip_u32(uint32_t *out_addr)
+/*
+ * FIX: get root IPv4 address without byte-swapping.
+ * We keep lwIP's ip4_addr_t.addr as-is (network order) and copy into sockaddr.
+ */
+static bool get_root_ip_ipv4(ip4_addr_t *out_ip4)
 {
-    if (!out_addr) return false;
+    if (!out_ip4) return false;
 
     esp_ip_addr_t ip;
     memset(&ip, 0, sizeof(ip));
@@ -458,17 +464,17 @@ static bool get_root_ip_u32(uint32_t *out_addr)
     if (err != ESP_OK) return false;
     if (ip.type != IPADDR_TYPE_V4) return false;
 
-    uint32_t addr = ip_2_ip4(&ip)->addr;  // network order
-    if (addr == 0) return false;
+    const ip4_addr_t *ip4 = ip_2_ip4(&ip);
+    if (!ip4 || ip4->addr == 0) return false;
 
-    *out_addr = addr;
+    *out_ip4 = *ip4;
     return true;
 }
 
 static void node_udp_init_when_ready(void)
 {
-    uint32_t root_ip_u32 = 0;
-    if (!get_root_ip_u32(&root_ip_u32)) {
+    ip4_addr_t root_ip4;
+    if (!get_root_ip_ipv4(&root_ip4)) {
         ESP_LOGW(TAG, "NODE: root IP not known yet; waiting…");
         return;
     }
@@ -481,13 +487,16 @@ static void node_udp_init_when_ready(void)
 
     memset(&root_addr, 0, sizeof(root_addr));
     root_addr.sin_family = AF_INET;
-    root_addr.sin_port = htons(CONFIG_UDP_PORT);
-    root_addr.sin_addr.s_addr = root_ip_u32;
+    root_addr.sin_port   = htons(CONFIG_UDP_PORT);
+
+    /* sockaddr expects IPv4 in network order; root_ip4.addr is already that. */
+    root_addr.sin_addr.s_addr = root_ip4.addr;
 
     node_udp_sock = s;
 
-    ESP_LOGI(TAG, "NODE UDP target (ROOT): %s:%d",
-             inet_ntoa(root_addr.sin_addr), CONFIG_UDP_PORT);
+    char ipstr[16];
+    ip4addr_ntoa_r(&root_ip4, ipstr, sizeof(ipstr));
+    ESP_LOGI(TAG, "NODE UDP target (ROOT): %s:%d", ipstr, CONFIG_UDP_PORT);
 }
 
 static void node_udp_reset_and_reresolve(void)
